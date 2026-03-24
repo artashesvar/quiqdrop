@@ -2,4 +2,4 @@
 # ffmpeg is required to process audio files (used by pydub under the hood).
 
 [phases.setup]
-nixPkgs = ["ffmpeg"]
+nixPkgs = ["ffmpeg", "python311"]
