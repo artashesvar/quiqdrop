@@ -1,0 +1,20 @@
+# Telegram bot framework (v20+ is fully async)
+python-telegram-bot[job-queue]>=20.0
+
+# OpenAI SDK — used for Whisper transcription
+openai>=1.0.0
+
+# Anthropic SDK — used for Claude summarisation
+anthropic>=0.25.0
+
+# Notion SDK — used to list pages and create notes
+notion-client>=2.0.0
+
+# Async HTTP client + web server — used for the Notion OAuth callback web server
+aiohttp>=3.9.0
+
+# Load environment variables from a .env file during local development
+python-dotenv>=1.0.0
+
+# Audio processing library (required alongside ffmpeg for voice file handling)
+pydub>=0.25.0
