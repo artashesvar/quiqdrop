@@ -10,3 +10,6 @@ venv/
 
 # Database (user data lives here — keep it local)
 users.db
+
+# macOS
+.DS_Store
