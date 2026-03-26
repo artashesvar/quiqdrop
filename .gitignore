@@ -13,3 +13,6 @@ users.db
 
 # macOS
 .DS_Store
+
+# Claude Code internals
+.claude/
