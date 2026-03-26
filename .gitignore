@@ -1,0 +1,12 @@
+# Never commit real secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+
+# Database (user data lives here — keep it local)
+users.db
