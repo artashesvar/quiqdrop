@@ -5,6 +5,10 @@ A Telegram bot that receives voice messages, transcribes them with OpenAI
 Whisper, structures them with GPT, and saves them as a new page in Notion.
 The user sends a voice note → gets back a clean, readable Notion page.
 
+This is a multi-user bot. Each user connects their own Notion workspace via
+OAuth (public Notion integration). The bot stores per-user tokens and their
+chosen destination page.
+
 ## Role
 You are a senior backend engineer and the main builder of Quiqdrop.
 You own the entire codebase and make all structural decisions.
@@ -38,16 +42,28 @@ quiqdrop/
 - Telegram: python-telegram-bot
 - Transcription: OpenAI Whisper API
 - Structuring: OpenAI GPT API
-- Storage: Notion API
+- Notion: OAuth public integration (multi-user)
+- Web server: aiohttp — handles Notion OAuth callback
+- Storage: Notion API + local SQLite (per-user tokens + page selection)
 - Repo: GitHub
 
 ## How the bot works (flow)
+
+### First-time setup (per user)
+1. User sends /start
+2. Bot sends OAuth link → user clicks and authorises Notion
+3. Notion redirects to our callback URL with a code
+4. Bot exchanges code for access token → stores it
+5. Bot asks user to select destination page
+6. Bot confirms: "You're all set. Send a voice note anytime 🎤"
+
+### Main flow (every voice note)
 1. User sends voice message on Telegram
 2. Bot downloads the audio file
 3. Audio is sent to Whisper → returns raw transcript
 4. Transcript is sent to GPT with structuring prompt → returns JSON
-5. JSON is used to create a new child page in Notion
-6. Bot replies to user: "Saved to Notion ✅"
+5. JSON is used to create a new child page in the user's chosen Notion page
+6. Bot replies: "Saved to Notion ✅"
 
 ## Output structure in Notion
 Each voice note creates a page with:
@@ -82,14 +98,21 @@ For other tasks, paste the relevant role file at the start of a new session:
 ## Environment variables needed
 TELEGRAM_BOT_TOKEN=
 OPENAI_API_KEY=
-NOTION_API_KEY=
-NOTION_PARENT_PAGE_ID=
+ANTHROPIC_API_KEY=
+NOTION_CLIENT_ID=
+NOTION_CLIENT_SECRET=
+NOTION_REDIRECT_URI=
+PORT=8080
 
 ## Current status
-[ ] GitHub repo created
-[ ] CLAUDE.md created
-[ ] /roles folder created
-[ ] Project structure scaffolded
-[ ] requirements.txt created
-[ ] .env file created (not committed)
-[ ] First push to GitHub done
+[x] GitHub repo created
+[x] CLAUDE.md created
+[x] /roles folder created
+[x] Project structure scaffolded
+[x] requirements.txt created
+[x] .env file created (not committed)
+[x] First push to GitHub done
+[ ] Notion public integration created (get CLIENT_ID + CLIENT_SECRET)
+[ ] NOTION_REDIRECT_URI confirmed (Railway URL or ngrok for local dev)
+[ ] src/ files implemented
+[ ] End-to-end test: voice note → Notion page
