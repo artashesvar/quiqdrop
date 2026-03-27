@@ -34,8 +34,9 @@ def _remove_repeated_words(text: str) -> str:
 def _normalize_whitespace(text: str) -> str:
     """Collapse multiple spaces/newlines and fix spacing around punctuation."""
     text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"\s([,.!?])", r"\1", text)       # remove space before punctuation
-    text = re.sub(r"([.!?])([A-Z])", r"\1 \2", text)  # ensure space after sentence end
+    text = re.sub(r",\s*([.!?])", r"\1", text)         # comma before end punctuation → drop comma
+    text = re.sub(r"\s([,.!?])", r"\1", text)           # remove space before punctuation
+    text = re.sub(r"([.!?])([A-Z])", r"\1 \2", text)   # ensure space after sentence end
     return text
 
 
