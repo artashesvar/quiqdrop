@@ -10,7 +10,6 @@ load_dotenv(_ROOT / ".env", override=True)
 _REQUIRED = [
     "TELEGRAM_BOT_TOKEN",
     "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
     "NOTION_CLIENT_ID",
     "NOTION_CLIENT_SECRET",
     "NOTION_REDIRECT_URI",
@@ -22,7 +21,7 @@ for _var in _REQUIRED:
 
 TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENAI_API_KEY: str = os.environ["OPENAI_API_KEY"]
-ANTHROPIC_API_KEY: str = os.environ["ANTHROPIC_API_KEY"]
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")  # reserved for future use
 NOTION_CLIENT_ID: str = os.environ["NOTION_CLIENT_ID"]
 NOTION_CLIENT_SECRET: str = os.environ["NOTION_CLIENT_SECRET"]
 NOTION_REDIRECT_URI: str = os.environ["NOTION_REDIRECT_URI"]

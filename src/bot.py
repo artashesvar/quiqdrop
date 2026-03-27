@@ -22,6 +22,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress httpx INFO logs — they contain the full bot token in the URL
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle the /start command."""
@@ -55,9 +58,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle any non-voice, non-command message."""
+    if not update.message:
+        return
     await update.message.reply_text(
         "Send me a voice note to get started 🎤"
     )
+
+
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log all unhandled handler errors so nothing fails silently in production."""
+    logger.error("Update %s caused error: %s", update, context.error, exc_info=context.error)
 
 
 def main() -> None:
@@ -72,6 +82,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.ALL, handle_unknown))
+    app.add_error_handler(handle_error)
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
