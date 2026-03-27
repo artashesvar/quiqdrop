@@ -15,6 +15,8 @@ from telegram.ext import (
 )
 
 import src.config as config
+from src.transcribe import transcribe_audio
+from src.text_cleaner import clean_transcript
 
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
@@ -46,14 +48,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming voice messages."""
+    """Handle incoming voice messages: download, transcribe, reply."""
     user = update.effective_user
-    logger.info("User %s sent a voice note (duration: %ss)",
-                user.id, update.message.voice.duration)
+    duration = update.message.voice.duration
+    file_unique_id = update.message.voice.file_unique_id
+    logger.info("Voice from user %s | duration=%ds", user.id, duration)
 
-    await update.message.reply_text(
-        "🎤 Got your voice note! Transcription coming soon..."
-    )
+    file_path = f"/tmp/voice_{file_unique_id}.ogg"
+    try:
+        voice_file = await update.message.voice.get_file()
+        await voice_file.download_to_drive(file_path)
+        file_size = os.path.getsize(file_path)
+        logger.info("Downloaded to %s | size=%d bytes", file_path, file_size)
+
+        await update.message.reply_text("Transcribing your voice note...")
+        transcript = await transcribe_audio(file_path)
+
+        if config.ENABLE_TRANSCRIPT_CLEANING:
+            raw_preview = transcript[:100]
+            transcript = clean_transcript(transcript)
+            logger.info("Before: %.100s | After: %.100s", raw_preview, transcript[:100])
+
+        await update.message.reply_text(f"Transcript:\n\n{transcript}")
+
+    except Exception as e:
+        logger.error("handle_voice failed for user %s: %s", user.id, e)
+        await update.message.reply_text("Something went wrong. Please try again.")
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logger.info("Cleaned up %s", file_path)
 
 
 async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
