@@ -17,8 +17,9 @@ def _remove_fillers(text: str) -> str:
     """Remove standalone filler sounds: um, uh, hmm, erm, er, you know."""
     text = re.sub(r"\b(um+|uh+|hmm*|erm?|you know)\b", "", text, flags=re.IGNORECASE)
     # Clean up orphaned commas left behind: ", ," → "," and leading ", "
-    text = re.sub(r",\s*,", ",", text)
-    text = re.sub(r"^\s*,\s*", "", text)
+    text = re.sub(r",\s*,", ",", text)   # double commas
+    text = re.sub(r"^\s*,\s*", "", text)  # leading comma
+    text = re.sub(r",\s*$", "", text)     # trailing comma
     return text
 
 

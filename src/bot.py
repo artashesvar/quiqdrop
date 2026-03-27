@@ -15,6 +15,9 @@ from telegram.ext import (
 )
 
 import src.config as config
+
+_MAX_VOICE_DURATION_SEC = 300    # 5 minutes — beyond this Whisper quality degrades
+_MAX_VOICE_SIZE_BYTES = 20 * 1024 * 1024  # 20MB — Whisper hard limit is 25MB
 from src.transcribe import transcribe_audio
 from src.text_cleaner import clean_transcript
 
@@ -54,20 +57,41 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file_unique_id = update.message.voice.file_unique_id
     logger.info("Voice from user %s | duration=%ds", user.id, duration)
 
-    file_path = f"/tmp/voice_{file_unique_id}.ogg"
+    # Issue 3: reject before downloading if duration is too long
+    if duration > _MAX_VOICE_DURATION_SEC:
+        await update.message.reply_text(
+            f"Voice note is too long ({duration}s). Please keep it under 5 minutes."
+        )
+        return
+
+    file_path = f"/tmp/voice_{user.id}_{file_unique_id}.ogg"  # issue 8: include user.id
     try:
         voice_file = await update.message.voice.get_file()
         await voice_file.download_to_drive(file_path)
         file_size = os.path.getsize(file_path)
         logger.info("Downloaded to %s | size=%d bytes", file_path, file_size)
 
+        # Issue 3: reject after downloading if file is too large
+        if file_size > _MAX_VOICE_SIZE_BYTES:
+            await update.message.reply_text(
+                "Voice note file is too large. Please send a shorter recording."
+            )
+            return
+
         await update.message.reply_text("Transcribing your voice note...")
         transcript = await transcribe_audio(file_path)
 
+        # Issue 1: handle empty transcript (silence, noise, very short clip)
+        if not transcript.strip():
+            await update.message.reply_text(
+                "I couldn't hear anything clearly — please try again."
+            )
+            return
+
         if config.ENABLE_TRANSCRIPT_CLEANING:
-            raw_preview = transcript[:100]
+            before_len = len(transcript)
             transcript = clean_transcript(transcript)
-            logger.info("Before: %.100s | After: %.100s", raw_preview, transcript[:100])
+            logger.info("Cleaning: %d→%d chars", before_len, len(transcript))  # no content logged
 
         await update.message.reply_text(f"Transcript:\n\n{transcript}")
 

@@ -27,3 +27,4 @@ NOTION_CLIENT_SECRET: str = os.environ["NOTION_CLIENT_SECRET"]
 NOTION_REDIRECT_URI: str = os.environ["NOTION_REDIRECT_URI"]
 PORT: int = int(os.getenv("PORT", "8080"))
 ENABLE_TRANSCRIPT_CLEANING: bool = os.getenv("ENABLE_TRANSCRIPT_CLEANING", "true").lower() == "true"
+WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "whisper-1")
