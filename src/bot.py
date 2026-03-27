@@ -57,21 +57,21 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file_unique_id = update.message.voice.file_unique_id
     logger.info("Voice from user %s | duration=%ds", user.id, duration)
 
-    # Issue 3: reject before downloading if duration is too long
+    # Reject before downloading — saves bandwidth and OpenAI costs
     if duration > _MAX_VOICE_DURATION_SEC:
         await update.message.reply_text(
             f"Voice note is too long ({duration}s). Please keep it under 5 minutes."
         )
         return
 
-    file_path = f"/tmp/voice_{user.id}_{file_unique_id}.ogg"  # issue 8: include user.id
+    file_path = f"/tmp/voice_{user.id}_{file_unique_id}.ogg"  # include user_id to prevent collisions when two users send notes simultaneously
     try:
         voice_file = await update.message.voice.get_file()
         await voice_file.download_to_drive(file_path)
         file_size = os.path.getsize(file_path)
         logger.info("Downloaded to %s | size=%d bytes", file_path, file_size)
 
-        # Issue 3: reject after downloading if file is too large
+        # Telegram does not expose file size before download, so we must check after
         if file_size > _MAX_VOICE_SIZE_BYTES:
             await update.message.reply_text(
                 "Voice note file is too large. Please send a shorter recording."
@@ -81,7 +81,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Transcribing your voice note...")
         transcript = await transcribe_audio(file_path)
 
-        # Issue 1: handle empty transcript (silence, noise, very short clip)
+        # Whisper returns empty string for silence, pure noise, or sub-second clips
         if not transcript.strip():
             await update.message.reply_text(
                 "I couldn't hear anything clearly — please try again."
@@ -95,10 +95,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         await update.message.reply_text(f"Transcript:\n\n{transcript}")
 
+    # Catch-all so the user always gets a reply, even if transcription or cleanup raises
     except Exception as e:
         logger.error("handle_voice failed for user %s: %s", user.id, e)
         await update.message.reply_text("Something went wrong. Please try again.")
-    finally:
+    finally:  # always delete the temp file, even if transcription threw
         if os.path.exists(file_path):
             os.remove(file_path)
             logger.info("Cleaned up %s", file_path)
@@ -133,6 +134,7 @@ def main() -> None:
     app.add_error_handler(handle_error)
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
+    # Polling requires no public URL — works on Railway worker dynos without a web port
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
