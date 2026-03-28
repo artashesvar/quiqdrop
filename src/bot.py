@@ -20,6 +20,7 @@ _MAX_VOICE_DURATION_SEC = 300    # 5 minutes — beyond this Whisper quality deg
 _MAX_VOICE_SIZE_BYTES = 20 * 1024 * 1024  # 20MB — Whisper hard limit is 25MB
 from src.transcribe import transcribe_audio
 from src.text_cleaner import clean_transcript
+from src.structure import structure_transcript, StructuringError
 
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
@@ -29,6 +30,31 @@ logger = logging.getLogger(__name__)
 
 # Suppress httpx INFO logs — they contain the full bot token in the URL
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _format_structured(data: dict) -> str:
+    """Format a structured dict into a readable Telegram message."""
+    parts = [f"📝 {data['title']}", "", data["summary"]]
+
+    if data.get("key_points"):
+        parts.append("")
+        parts.append("💡 Key Points:")
+        for point in data["key_points"]:
+            parts.append(f"• {point}")
+
+    if data.get("action_items"):
+        parts.append("")
+        parts.append("✅ Action Items:")
+        for item in data["action_items"]:
+            parts.append(f"• {item}")
+
+    if data.get("decisions"):
+        parts.append("")
+        parts.append("🧠 Decisions:")
+        for decision in data["decisions"]:
+            parts.append(f"• {decision}")
+
+    return "\n".join(parts)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -93,7 +119,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             transcript = clean_transcript(transcript)
             logger.info("Cleaning: %d→%d chars", before_len, len(transcript))  # no content logged
 
-        await update.message.reply_text(f"Transcript:\n\n{transcript}")
+        if config.ENABLE_AI_STRUCTURING:
+            await update.message.reply_text("Structuring your note...")
+            try:
+                structured = await structure_transcript(transcript)
+                reply = _format_structured(structured)
+            except StructuringError as e:
+                logger.warning("Structuring failed, falling back to plain transcript: %s", e)
+                reply = f"Transcript:\n\n{transcript}"
+        else:
+            reply = f"Transcript:\n\n{transcript}"
+
+        await update.message.reply_text(reply)
 
     # Catch-all so the user always gets a reply, even if transcription or cleanup raises
     except Exception as e:
