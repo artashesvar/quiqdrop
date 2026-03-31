@@ -29,6 +29,10 @@ class NotionUnauthorizedError(NotionError):
     """Access token is invalid or has been revoked. User must reconnect."""
 
 
+class NotionPageNotFoundError(NotionError):
+    """Parent page does not exist or is no longer accessible. User must pick a new one."""
+
+
 def _extract_title(page: dict) -> str:
     """
     Extract the plain-text title from a Notion page object.
@@ -107,7 +111,8 @@ async def exchange_token(code: str) -> tuple[str, str]:
 async def search_pages(token: str) -> list[dict]:
     """
     Return up to 10 pages accessible to the integration.
-    Each entry: {"id": str, "title": str}.
+    Each entry: {"id": str, "title": str, "is_top_level": bool}.
+    is_top_level is True when the page's parent is the workspace root (not another page).
     Raises NotionUnauthorizedError or NotionError on failure.
     """
     try:
@@ -122,11 +127,38 @@ async def search_pages(token: str) -> list[dict]:
         raise NotionError(f"search_pages failed: {e.code} — {e}") from e
 
     pages = [
-        {"id": page["id"], "title": _extract_title(page)}
+        {
+            "id": page["id"],
+            "title": _extract_title(page),
+            "is_top_level": page.get("parent", {}).get("type") == "workspace",
+        }
         for page in result.get("results", [])
     ]
-    logger.info("search_pages returned %d pages", len(pages))
+    logger.info("search_pages returned %d pages (%d top-level)",
+                len(pages), sum(1 for p in pages if p["is_top_level"]))
     return pages
+
+
+async def fetch_child_pages(token: str, parent_id: str) -> list[dict]:
+    """
+    Return immediate child pages of parent_id (max 8).
+    Uses blocks.children.list and filters for type == "child_page" only.
+    Raises NotionUnauthorizedError or NotionError on failure.
+    """
+    try:
+        resp = await _notion.blocks.children.list(block_id=parent_id, auth=token)
+    except APIResponseError as e:
+        if e.code == APIErrorCode.Unauthorized:
+            raise NotionUnauthorizedError("Token invalid or revoked") from e
+        raise NotionError(f"fetch_child_pages failed: {e.code} — {e}") from e
+
+    children = [
+        {"id": block["id"], "title": block["child_page"]["title"]}
+        for block in resp.get("results", [])
+        if block.get("type") == "child_page"
+    ][:8]  # cap at 8 — leaves room for "Save here" + "Back" buttons
+    logger.info("fetch_child_pages for %s returned %d child pages", parent_id, len(children))
+    return children
 
 
 async def create_page(
@@ -138,7 +170,9 @@ async def create_page(
     """
     Create a child Notion page under parent_id with structured content.
     Returns (page_id, page_url).
-    Raises NotionUnauthorizedError or NotionError on failure.
+    Raises NotionUnauthorizedError if token is revoked.
+    Raises NotionPageNotFoundError if parent page is deleted or archived.
+    Raises NotionError on all other API failures.
     """
     # Truncate transcript to stay within Notion's 2000-char rich_text limit
     if len(transcript) > _RICH_TEXT_LIMIT - 10:
@@ -195,6 +229,10 @@ async def create_page(
     except APIResponseError as e:
         if e.code == APIErrorCode.Unauthorized:
             raise NotionUnauthorizedError("Token invalid or revoked") from e
+        if e.code == APIErrorCode.ObjectNotFound:
+            raise NotionPageNotFoundError("Parent page not found or deleted") from e
+        if e.code == APIErrorCode.ValidationError and "archived" in str(e).lower():
+            raise NotionPageNotFoundError("Parent page is archived (deleted)") from e
         raise NotionError(f"create_page failed: {e.code} — {e}") from e
 
     page_id: str = response["id"]

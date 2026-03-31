@@ -31,9 +31,11 @@ from src.db import (
 from src.notion import (
     NotionError,
     NotionOAuthError,
+    NotionPageNotFoundError,
     NotionUnauthorizedError,
     create_page,
     exchange_token,
+    fetch_child_pages,
     search_pages,
 )
 from src.structure import StructuringError, structure_transcript
@@ -58,6 +60,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # (~32 bytes per entry). Add TTL cleanup if the bot reaches thousands of daily users.
 _pending_oauth: dict[str, int] = {}
 
+# Page selection cache — maps short integer IDs to Notion page info per user.
+# Populated on each page fetch; resets on next fetch or bot restart.
+# Short IDs keep callback_data well within Telegram's 64-byte limit.
+# Grows by ~1 entry per user per page-fetch session — negligible at MVP scale.
+# If user count grows significantly, add eviction (e.g. keep only last N users).
+_page_cache: dict[int, dict[int, dict]] = {}       # user_id → {short_id → {id, title}}
+_page_top_level_ids: dict[int, list[int]] = {}     # user_id → [short_ids of top-level pages]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -75,19 +85,66 @@ def _build_oauth_url(state: str) -> str:
     return f"https://api.notion.com/v1/oauth/authorize?{params}"
 
 
-def _build_page_keyboard(pages: list[dict]) -> InlineKeyboardMarkup:
+def _build_parent_keyboard(user_id: int, pages: list[dict]) -> InlineKeyboardMarkup:
     """
-    Build an inline keyboard for page selection.
-    Telegram enforces a hard 64-byte limit on callback_data.
-    Format: select_page:{36-char UUID}:{title} — leaves ~14 chars for the title.
+    Step 1 keyboard — shows top-level pages only.
+    Assigns short integer IDs and caches them to stay within Telegram's 64-byte
+    callback_data limit. Format: page_parent:{short_id} (~14 bytes).
     """
+    _page_cache[user_id] = {}
+    _page_top_level_ids[user_id] = []
+    buttons = []
+    i = 0
+    for p in pages:
+        if not p.get("is_top_level"):
+            continue
+        _page_cache[user_id][i] = {"id": p["id"], "title": p["title"]}
+        _page_top_level_ids[user_id].append(i)
+        buttons.append([InlineKeyboardButton(p["title"][:40], callback_data=f"page_parent:{i}")])
+        i += 1
+    return InlineKeyboardMarkup(buttons)
+
+
+_NO_TOP_LEVEL_MSG = (
+    "No top-level pages found. All your shared pages appear to be subpages.\n\n"
+    "In Notion, share a top-level page with QuiqDrop, then try again."
+)
+
+
+def _rebuild_parent_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Rebuild step 1 keyboard from cache — used by the Back button (no API call)."""
     buttons = [
         [InlineKeyboardButton(
-            p["title"][:40],  # display label can be longer
-            callback_data=f"select_page:{p['id']}:{p['title'][:14]}",
+            _page_cache[user_id][i]["title"][:40],
+            callback_data=f"page_parent:{i}",
         )]
-        for p in pages
+        for i in _page_top_level_ids.get(user_id, [])
     ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def _build_subpage_keyboard(
+    user_id: int,
+    parent_short_id: int,
+    parent_title: str,
+    subpages: list[dict],
+) -> InlineKeyboardMarkup:
+    """
+    Step 2 keyboard — shows 'Save here' for the parent + each subpage + Back.
+    Subpages are added to the cache with continuing short IDs.
+    """
+    next_id = (max(_page_cache[user_id].keys()) + 1) if _page_cache[user_id] else 0
+    buttons = [
+        [InlineKeyboardButton(
+            f"▶ Save to {parent_title[:30]}",
+            callback_data=f"page_select:{parent_short_id}",
+        )]
+    ]
+    for sub in subpages:
+        _page_cache[user_id][next_id] = {"id": sub["id"], "title": sub["title"]}
+        buttons.append([InlineKeyboardButton(f"  {sub['title'][:38]}", callback_data=f"page_select:{next_id}")])
+        next_id += 1
+    buttons.append([InlineKeyboardButton("← Back", callback_data="page_back")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -216,17 +273,67 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = query.from_user
     data = query.data
 
-    if data.startswith("select_page:"):
-        # format: select_page:{page_id}:{short_title}
-        parts = data.split(":", 2)
-        page_id = parts[1]
-        page_title = parts[2] if len(parts) > 2 else "selected page"
+    if data.startswith("page_parent:"):
+        # User tapped a top-level page — fetch its children and show step 2,
+        # or save directly if it has no subpages.
+        short_id = int(data.split(":")[1])
+        cached = _page_cache.get(user.id, {}).get(short_id)
+        if not cached:
+            await query.edit_message_text("Session expired. Use /settings to pick a page again.")
+            return
+        page_id, page_title = cached["id"], cached["title"]
+        config_row = await get_user_config(user.id)
+        if config_row is None:
+            await query.edit_message_text("You're not connected. Use /connect first.")
+            return
+        token, _ = config_row
+        try:
+            subpages = await fetch_child_pages(token, page_id)
+        except NotionError as e:
+            logger.error("fetch_child_pages failed for user %s page %s: %s", user.id, page_id, e)
+            # Graceful degradation — if children can't be fetched, treat parent as leaf
+            # and save to it directly. User is not notified; error is logged above.
+            subpages = []
+        if not subpages:
+            # No subpages — save to the parent directly
+            await save_parent_page(user.id, page_id)
+            logger.info("User %s selected page %s (no subpages)", user.id, page_id)
+            await query.edit_message_text(
+                f"✅ All set! Your notes will be saved to *{page_title}*\n\n"
+                "Send me a voice note anytime 🎤",
+                parse_mode="Markdown",
+            )
+        else:
+            await query.edit_message_text(
+                f"📁 *{page_title}*\nSave here or pick a subpage:",
+                parse_mode="Markdown",
+                reply_markup=_build_subpage_keyboard(user.id, short_id, page_title, subpages),
+            )
+
+    elif data.startswith("page_select:"):
+        # User chose a final destination (parent "Save here" or a specific subpage)
+        short_id = int(data.split(":")[1])
+        cached = _page_cache.get(user.id, {}).get(short_id)
+        if not cached:
+            await query.edit_message_text("Session expired. Use /settings to pick a page again.")
+            return
+        page_id, page_title = cached["id"], cached["title"]
         await save_parent_page(user.id, page_id)
-        logger.info("User %s selected page %s", user.id, page_id)
+        logger.info("User %s selected page %s (%s)", user.id, page_id, page_title)
         await query.edit_message_text(
-            f"Got it. Saving all your notes to: *{page_title}* 📝\n\n"
+            f"✅ All set! Your notes will be saved to *{page_title}*\n\n"
             "Send me a voice note anytime 🎤",
             parse_mode="Markdown",
+        )
+
+    elif data == "page_back":
+        # User tapped Back — rebuild step 1 from cache (no API call)
+        if user.id not in _page_top_level_ids:
+            await query.edit_message_text("Session expired. Use /settings to pick a page again.")
+            return
+        await query.edit_message_text(
+            "Now choose where to save your notes:",
+            reply_markup=_rebuild_parent_keyboard(user.id),
         )
 
     elif data == "change_page":
@@ -247,9 +354,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "then try again."
             )
             return
+        keyboard = _build_parent_keyboard(user.id, pages)
+        if not keyboard.inline_keyboard:
+            await query.edit_message_text(_NO_TOP_LEVEL_MSG)
+            return
         await query.edit_message_text(
-            "Choose where to save your notes:",
-            reply_markup=_build_page_keyboard(pages),
+            "Now choose where to save your notes:",
+            reply_markup=keyboard,
         )
 
     elif data == "disconnect_confirm_prompt":
@@ -358,6 +469,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text(
                 f"{reply}\n\n⚠️ Notion connection expired. Use /connect to reconnect."
             )
+        except NotionPageNotFoundError:
+            logger.warning("Parent page deleted for user %s — clearing stored page", user.id)
+            await save_parent_page(user.id, None)
+            await update.message.reply_text(
+                f"{reply}\n\n⚠️ The destination page no longer exists in Notion. "
+                "Use /settings to pick a new one."
+            )
         except NotionError as e:
             logger.error("Notion save failed for user %s: %s", user.id, e)
             await update.message.reply_text(
@@ -440,12 +558,20 @@ async def _oauth_callback(request: web.Request, ptb_app: Application) -> web.Res
         pages = []
 
     if pages:
-        await ptb_app.bot.send_message(
-            chat_id=user_id,
-            text=f"Connected to *{workspace_name}* 🎉\n\nNow choose where to save your notes:",
-            parse_mode="Markdown",
-            reply_markup=_build_page_keyboard(pages),
-        )
+        keyboard = _build_parent_keyboard(user_id, pages)
+        if keyboard.inline_keyboard:
+            await ptb_app.bot.send_message(
+                chat_id=user_id,
+                text=f"Connected to *{workspace_name}* 🎉\n\nNow choose where to save your notes:",
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        else:
+            await ptb_app.bot.send_message(
+                chat_id=user_id,
+                text=f"Connected to *{workspace_name}* 🎉\n\n{_NO_TOP_LEVEL_MSG}",
+                parse_mode="Markdown",
+            )
     else:
         await ptb_app.bot.send_message(
             chat_id=user_id,
