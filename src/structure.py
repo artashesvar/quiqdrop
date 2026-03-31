@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 _client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
 _MODEL = "claude-sonnet-4-6"
-_MAX_TOKENS = 1000
+_MAX_TOKENS = 1000  # structured JSON output is compact — 1000 tokens covers even a 5-min note
 _MAX_INPUT_CHARS = 8000  # truncation threshold — 8000 chars covers ~1200 words, well beyond any real voice note
 
 _SYSTEM_PROMPT = """\

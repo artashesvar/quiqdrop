@@ -203,6 +203,7 @@ async def create_page(
         for decision in structured["decisions"]:
             children.append(_bullet(decision))
 
+    # Transcript goes in a toggle — keeps the page scannable; full text accessible on demand
     children.extend([
         _divider(),
         {

@@ -67,3 +67,51 @@ Cleaning is nearly always an improvement, but in edge cases it could alter meani
 **Function-word-only deduplication**: Deduplicating all repeated words would destroy intentional speech patterns like "again and again" or "very very important". Limiting dedup to a fixed set of function words (`I`, `the`, `a`, `and`, etc.) catches accidental stutters without altering meaning. Content words are never touched.
 
 **Whitespace and punctuation normalization**: Whisper sometimes produces `end.Start` (missing space after sentence), `good , point` (space before comma), or `good,.` (comma immediately before full stop — an artifact left by filler removal). These four regex rules fix all of those cases without making any semantic changes to the text.
+
+---
+
+## Why Claude Sonnet (not GPT-4, Gemini, etc.) for structuring
+
+The project already uses the Anthropic API (ANTHROPIC_API_KEY). Claude Sonnet reliably follows strict output format instructions — specifically "return only valid JSON, no markdown fences, no preamble" — which is critical because the response is parsed directly with `json.loads()`. GPT-4 follows similar instructions well but adds a second vendor relationship and billing account for a task Claude handles just as well. Gemini was not evaluated. If the Anthropic API ever becomes unavailable, swapping the model in `structure.py` is a one-line change.
+
+---
+
+## Why ENABLE_AI_STRUCTURING is an optional flag (not always on)
+
+Structuring costs money on every voice note — one Claude API call per message. During development and debugging it is useful to turn it off and get the raw or cleaned transcript without spending API credits. The flag also lets the bot degrade gracefully: if `ENABLE_AI_STRUCTURING=false`, the bot still saves a plain-transcript page to Notion, which is acceptable output. Default is `true` because structured output is the whole point of the product.
+
+---
+
+## Why 8000-char input cap for structuring
+
+A 5-minute voice note at average speech rate (~130 words/min) produces roughly 650 words — about 4000 characters. 8000 chars is double that, comfortably covering even fast speakers or dense technical content. Claude's context window is far larger, but we truncate defensively: it bounds per-call cost, keeps latency predictable, and handles any edge case where Whisper produces unexpectedly long output. The truncation is logged as a warning so it is visible if it ever fires in practice.
+
+---
+
+## Why Notion public OAuth (not an internal integration)
+
+Internal Notion integrations are scoped to a single workspace — the one the developer owns. QuiqDrop is a multi-user bot: each user connects their own personal or team Notion workspace. This requires a public integration, which enables the standard OAuth 2.0 flow: user clicks a link, authorises in their browser, and Notion issues a per-user access token. The token is then stored in SQLite and used for all subsequent API calls on behalf of that user.
+
+---
+
+## Why SQLite + aiosqlite (not Postgres, Redis, etc.)
+
+The bot runs as a single process on one Railway worker dyno. There is no horizontal scaling, no need for cross-process shared state, and no concurrent writes that would stress SQLite's locking model. aiosqlite wraps SQLite with an async interface so database calls never block the event loop. Adding Postgres would require a second Railway service, connection pooling, and a migration story — none of which add value at MVP scale. Revisit when user count or deployment architecture changes.
+
+---
+
+## Why /tmp for the SQLite database on Railway
+
+Railway worker dynos have ephemeral local storage at `/tmp`. The trade-off is that the database resets on every redeploy, so all users must re-authorise after a deployment. This is acceptable for an MVP — users are informed by the bot when their token is expired and reconnecting takes 30 seconds. The alternative (Railway's persistent PostgreSQL add-on) adds cost and infra complexity for a problem that barely exists at current scale.
+
+---
+
+## Why aiohttp for the OAuth callback web server
+
+aiohttp is already a direct dependency — `notion.py` uses `aiohttp.ClientSession` for the Notion token exchange HTTP call. Adding Flask or FastAPI to handle one GET route would be a net increase in dependencies and process complexity. aiohttp's `web.Application` runs on the same asyncio event loop as the Telegram bot, requires no threading, and integrates cleanly with the existing async codebase. One route, one file, zero new packages.
+
+---
+
+## Why polling and web server run in the same process
+
+The bot needs two concurrent long-running tasks: Telegram polling (outbound HTTP long-poll) and the aiohttp web server (inbound HTTP for the OAuth callback). Running them in the same asyncio event loop via `asyncio.gather` / `web.AppRunner` is simpler than two separate processes — no IPC, no message queues, no port coordination. python-telegram-bot 20.x exposes clean `async with` lifecycle hooks that compose naturally with aiohttp's runner. The only coupling point is `ptb_app` being passed into the OAuth callback handler so it can send Telegram messages after token exchange.
