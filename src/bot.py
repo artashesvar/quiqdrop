@@ -1,9 +1,11 @@
 # Telegram listener and main entry point
 import asyncio
+import contextlib
 import logging
 import os
 import secrets
 import sys
+import time
 from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,13 +22,16 @@ from telegram.ext import (
 )
 
 import src.config as config
+from src.reminder_scheduler import reminder_scheduler_loop
 from src.db import (
     delete_user_config,
+    get_reminder_preferences,
     get_user_config,
     get_workspace_name,
     init_db,
     save_parent_page,
     save_user_token,
+    update_reminder_preferences,
 )
 from src.notion import (
     NotionError,
@@ -54,11 +59,25 @@ logger = logging.getLogger(__name__)
 # Suppress httpx INFO logs — they contain the full bot token in the URL
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Maps random hex state token → telegram_user_id.
+# Maps random hex state token → (telegram_user_id, created_at_monotonic).
 # In-memory: resets on restart (user clicks /connect again — acceptable for MVP).
-# Entries for abandoned OAuth flows are never removed — negligible at MVP scale
-# (~32 bytes per entry). Add TTL cleanup if the bot reaches thousands of daily users.
-_pending_oauth: dict[str, int] = {}
+# Stale entries (abandoned flows) are evicted by _evict_stale_oauth() called on each /connect.
+_OAUTH_TTL_SEC = 3600  # 1 hour — plenty of time to complete the OAuth flow
+_pending_oauth: dict[str, tuple[int, float]] = {}
+
+
+def _evict_stale_oauth() -> None:
+    """Remove OAuth state entries older than _OAUTH_TTL_SEC (abandoned flows)."""
+    cutoff = time.monotonic() - _OAUTH_TTL_SEC
+    stale = [s for s, (_, ts) in _pending_oauth.items() if ts < cutoff]
+    for s in stale:
+        del _pending_oauth[s]
+    if stale:
+        logger.debug("Evicted %d stale OAuth state(s)", len(stale))
+
+# Tracks users currently processing a voice note — prevents concurrent API hammering.
+# Removed from the set in handle_voice's finally block.
+_processing_users: set[int] = set()
 
 # Page selection cache — maps short integer IDs to Notion page info per user.
 # Populated on each page fetch; resets on next fetch or bot restart.
@@ -148,6 +167,11 @@ def _build_subpage_keyboard(
     return InlineKeyboardMarkup(buttons)
 
 
+def _truncate_url(url: str, max_len: int = 45) -> str:
+    """Truncate a URL to max_len chars, appending '...' if cut."""
+    return url[:max_len] + "..." if len(url) > max_len else url
+
+
 def _format_structured(data: dict) -> str:
     """Format a structured dict into a readable Telegram message."""
     parts = [f"📝 {data['title']}", "", data["summary"]]
@@ -207,8 +231,9 @@ async def connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     logger.info("User %s initiated /connect", user.id)
 
+    _evict_stale_oauth()
     state = secrets.token_hex(16)
-    _pending_oauth[state] = user.id
+    _pending_oauth[state] = (user.id, time.monotonic())
 
     url = _build_oauth_url(state)
     keyboard = InlineKeyboardMarkup([
@@ -237,7 +262,8 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [
             InlineKeyboardButton("Change Page", callback_data="change_page"),
             InlineKeyboardButton("Disconnect", callback_data="disconnect_confirm_prompt"),
-        ]
+        ],
+        [InlineKeyboardButton("⏰ Reminders", callback_data="settings_reminders")],
     ])
     await update.message.reply_text(
         f"*Your Notion settings*\n\nWorkspace: {workspace}\nDestination page: {page_display}",
@@ -258,6 +284,35 @@ async def disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "Are you sure you want to disconnect your Notion workspace?",
         reply_markup=keyboard,
     )
+
+
+# ---------------------------------------------------------------------------
+# Reminder settings helpers
+# ---------------------------------------------------------------------------
+
+async def _build_reminder_settings(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Build (text, InlineKeyboardMarkup) for the reminder settings submenu."""
+    prefs = await get_reminder_preferences(user_id)
+    _, daily, weekly = prefs if prefs else ("UTC", True, True)
+    daily_status = "✅ Enabled" if daily else "❌ Disabled"
+    weekly_status = "✅ Enabled" if weekly else "❌ Disabled"
+    text = (
+        "⏰ *Reminder Settings*\n\n"
+        f"Daily reminders (9am): {daily_status}\n"
+        f"Weekly reminders (Monday 9am): {weekly_status}"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"Daily: {'ON ✅' if daily else 'OFF ❌'}",
+            callback_data="toggle_daily",
+        )],
+        [InlineKeyboardButton(
+            f"Weekly: {'ON ✅' if weekly else 'OFF ❌'}",
+            callback_data="toggle_weekly",
+        )],
+        [InlineKeyboardButton("« Back", callback_data="settings_back")],
+    ])
+    return text, keyboard
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +437,45 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "disconnect_cancel":
         await query.edit_message_text("Cancelled. Your workspace is still connected.")
 
+    elif data == "settings_reminders":
+        text, keyboard = await _build_reminder_settings(user.id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif data == "toggle_daily":
+        prefs = await get_reminder_preferences(user.id)
+        _, daily, _ = prefs if prefs else ("UTC", True, True)
+        await update_reminder_preferences(user.id, daily_enabled=not daily)
+        text, keyboard = await _build_reminder_settings(user.id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif data == "toggle_weekly":
+        prefs = await get_reminder_preferences(user.id)
+        _, _, weekly = prefs if prefs else ("UTC", True, True)
+        await update_reminder_preferences(user.id, weekly_enabled=not weekly)
+        text, keyboard = await _build_reminder_settings(user.id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif data == "settings_back":
+        config_row = await get_user_config(user.id)
+        if config_row is None:
+            await query.edit_message_text("No Notion workspace connected. Use /connect.")
+            return
+        _, page_id = config_row
+        workspace = await get_workspace_name(user.id) or "Notion"
+        page_display = "Selected ✅" if page_id else "_not selected yet_"
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Change Page", callback_data="change_page"),
+                InlineKeyboardButton("Disconnect", callback_data="disconnect_confirm_prompt"),
+            ],
+            [InlineKeyboardButton("⏰ Reminders", callback_data="settings_reminders")],
+        ])
+        await query.edit_message_text(
+            f"*Your Notion settings*\n\nWorkspace: {workspace}\nDestination page: {page_display}",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
     else:
         logger.warning("handle_callback: unrecognised callback_data=%s from user %s", data, user.id)
 
@@ -404,7 +498,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    if user.id in _processing_users:
+        await update.message.reply_text(
+            "Still processing your previous note — please wait a moment before sending another."
+        )
+        return
+
     file_path = f"/tmp/voice_{user.id}_{file_unique_id}.ogg"
+    _processing_users.add(user.id)
     try:
         # Auth check before doing any work
         config_row = await get_user_config(user.id)
@@ -451,41 +552,52 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text("Structuring your note...")
             try:
                 structured = await structure_transcript(transcript)
-                reply = _format_structured(structured)
             except StructuringError as e:
                 logger.warning("Structuring failed, falling back to plain transcript: %s", e)
                 structured = {"title": "Voice note", "summary": transcript, "key_points": []}
-                reply = f"Transcript:\n\n{transcript}"
         else:
             structured = {"title": "Voice note", "summary": transcript, "key_points": []}
-            reply = f"Transcript:\n\n{transcript}"
 
         # Save to Notion
         try:
             _, page_url = await create_page(token, parent_page_id, structured, transcript)
-            await update.message.reply_text(f"{reply}\n\n✅ Saved to Notion!\n{page_url}")
+            await update.message.reply_text(
+                f"✅ Saved to Notion!\n\n"
+                f"📄 {structured['title']}\n\n"
+                f"{structured['summary']}\n\n"
+                f"[{_truncate_url(page_url)}]({page_url})",
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
         except NotionUnauthorizedError:
             logger.warning("Notion token expired for user %s", user.id)
             await update.message.reply_text(
-                f"{reply}\n\n⚠️ Notion connection expired. Use /connect to reconnect."
+                f"📄 {structured['title']}\n\n"
+                f"{structured['summary']}\n\n"
+                "⚠️ Notion connection expired. Use /connect to reconnect."
             )
         except NotionPageNotFoundError:
             logger.warning("Parent page deleted for user %s — clearing stored page", user.id)
             await save_parent_page(user.id, None)
             await update.message.reply_text(
-                f"{reply}\n\n⚠️ The destination page no longer exists in Notion. "
+                f"📄 {structured['title']}\n\n"
+                f"{structured['summary']}\n\n"
+                "⚠️ The destination page no longer exists in Notion. "
                 "Use /settings to pick a new one."
             )
         except NotionError as e:
             logger.error("Notion save failed for user %s: %s", user.id, e)
             await update.message.reply_text(
-                f"{reply}\n\n⚠️ Transcribed but couldn't save to Notion. Please try again."
+                f"📄 {structured['title']}\n\n"
+                f"{structured['summary']}\n\n"
+                "⚠️ Transcribed but couldn't save to Notion. Please try again."
             )
 
     except Exception as e:
         logger.error("handle_voice failed for user %s: %s", user.id, e)
         await update.message.reply_text("Something went wrong. Please try again.")
     finally:
+        _processing_users.discard(user.id)
         if os.path.exists(file_path):
             os.remove(file_path)
             logger.info("Cleaned up %s", file_path)
@@ -513,6 +625,22 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def _oauth_callback(request: web.Request, ptb_app: Application) -> web.Response:
     """Handle GET /oauth/notion/callback from Notion after user authorises."""
+    try:
+        return await _oauth_callback_inner(request, ptb_app)
+    except Exception:
+        logger.exception("Unexpected error in OAuth callback")
+        return web.Response(
+            text=(
+                "<html><body><h1>Something went wrong.</h1>"
+                "<p>Please return to Telegram and try /connect again.</p></body></html>"
+            ),
+            content_type="text/html",
+            status=500,
+        )
+
+
+async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> web.Response:
+    """Core OAuth callback logic — called by _oauth_callback which wraps it in a catch-all."""
     code = request.rel_url.query.get("code")
     state = request.rel_url.query.get("state")
 
@@ -523,7 +651,8 @@ async def _oauth_callback(request: web.Request, ptb_app: Application) -> web.Res
             status=400,
         )
 
-    user_id = _pending_oauth.pop(state, None)
+    entry = _pending_oauth.pop(state, None)
+    user_id = entry[0] if entry is not None else None
     if user_id is None:
         logger.warning("OAuth callback received unknown state: %s", state)
         return web.Response(
@@ -595,13 +724,17 @@ async def _oauth_callback(request: web.Request, ptb_app: Application) -> web.Res
 
 
 def _create_web_app(ptb_app: Application) -> web.Application:
-    """Create the aiohttp web application for OAuth callbacks."""
+    """Create the aiohttp web application for OAuth callbacks and health checks."""
     app = web.Application()
 
     async def callback_handler(request: web.Request) -> web.Response:
         return await _oauth_callback(request, ptb_app)
 
+    async def health_handler(request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
     app.router.add_get("/oauth/notion/callback", callback_handler)
+    app.router.add_get("/health", health_handler)
     return app
 
 
@@ -636,11 +769,15 @@ async def _run() -> None:
         await ptb_app.start()
         await ptb_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         logger.info("Bot polling started.")
+        scheduler_task = asyncio.create_task(reminder_scheduler_loop(ptb_app.bot))
         try:
             await asyncio.Event().wait()  # run until Ctrl+C / SIGTERM
         except (KeyboardInterrupt, SystemExit):
             pass
         finally:
+            scheduler_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await scheduler_task
             # Must stop before async with __aexit__ calls shutdown() — otherwise RuntimeError
             await ptb_app.updater.stop()
             await ptb_app.stop()

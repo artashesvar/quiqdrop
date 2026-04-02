@@ -1,5 +1,6 @@
 # Notion API integration — OAuth token exchange, page search, page creation
 import logging
+from datetime import datetime, timezone
 
 import aiohttp
 from notion_client import AsyncClient
@@ -159,6 +160,79 @@ async def fetch_child_pages(token: str, parent_id: str) -> list[dict]:
     ][:8]  # cap at 8 — leaves room for "Save here" + "Back" buttons
     logger.info("fetch_child_pages for %s returned %d child pages", parent_id, len(children))
     return children
+
+
+_FETCH_PAGE_CAP = 3  # max API pages fetched per call (300 blocks) — covers all realistic cases
+
+
+async def fetch_child_pages_in_range(
+    token: str,
+    parent_id: str,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> list[dict]:
+    """
+    Return child pages of parent_id whose created_time falls within [start_dt, end_dt].
+    Both datetimes must be UTC-aware.
+    Returns list of dicts with keys: title, url.
+
+    Paginates through Notion's blocks.children.list (max 100 per page) up to
+    _FETCH_PAGE_CAP pages. Logs a warning if the cap is hit.
+
+    Raises NotionUnauthorizedError or NotionError on API failure.
+    """
+    all_blocks: list[dict] = []
+    cursor: str | None = None
+    pages_fetched = 0
+
+    while pages_fetched < _FETCH_PAGE_CAP:
+        kwargs: dict = {"block_id": parent_id, "auth": token}
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        try:
+            resp = await _notion.blocks.children.list(**kwargs)
+        except APIResponseError as e:
+            if e.code == APIErrorCode.Unauthorized:
+                raise NotionUnauthorizedError("Token invalid or revoked") from e
+            raise NotionError(f"fetch_child_pages_in_range failed: {e.code} — {e}") from e
+
+        all_blocks.extend(resp.get("results", []))
+        pages_fetched += 1
+
+        if not resp.get("has_more"):
+            break
+        cursor = resp.get("next_cursor")
+    else:
+        logger.warning(
+            "fetch_child_pages_in_range: hit %d-page cap for parent %s — some blocks may be missing",
+            _FETCH_PAGE_CAP, parent_id,
+        )
+
+    results = []
+    for block in all_blocks:
+        if block.get("type") != "child_page":
+            continue
+        raw_ts = block.get("created_time", "")
+        try:
+            created = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+        except ValueError:
+            logger.warning("Could not parse created_time %r on block %s", raw_ts, block.get("id"))
+            continue
+        if start_dt <= created <= end_dt:
+            page_id = block["id"].replace("-", "")
+            results.append({
+                "title": block["child_page"]["title"] or "Untitled",
+                "url": f"https://notion.so/{page_id}",
+            })
+
+    logger.info(
+        "fetch_child_pages_in_range for %s: %d pages in range [%s, %s] (fetched %d block pages)",
+        parent_id, len(results),
+        start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        pages_fetched,
+    )
+    return results
 
 
 async def create_page(

@@ -12,7 +12,8 @@ Send a voice note → get a clean, structured page in your Notion workspace.
 | 3 | Voice download + Whisper transcription + text cleaning | done |
 | 4A | AI structuring (Claude) | done |
 | 4B | Notion OAuth + page creation | done |
-| 5 | Settings / polish | not built |
+| 5 | Settings / polish | done |
+| 6A | Daily + weekly reminders with user preferences | done |
 
 ---
 
@@ -83,9 +84,10 @@ QuiqDrop uses Notion's public OAuth — each user connects their own workspace.
 python src/bot.py
 ```
 
-This starts two things on the same asyncio event loop:
+This starts three things on the same asyncio event loop:
 - **Telegram polling** — receives messages from Telegram
 - **aiohttp web server** on `PORT` — handles the Notion OAuth callback at `/oauth/notion/callback`
+- **Reminder scheduler** — background task that wakes every hour, sends 9am reminders to users in their local timezone
 
 Both must be running for the full flow to work. If testing locally, make sure your `NOTION_REDIRECT_URI` points to your local tunnel URL.
 
@@ -107,8 +109,16 @@ ENABLE_AI_STRUCTURING=true          # default — Claude structures the transcri
 |---------|--------------|
 | `/start` | Greet user, show connection status |
 | `/connect` | Start Notion OAuth flow — opens a browser link |
-| `/settings` | Show current workspace + destination page; options to change page or disconnect |
+| `/settings` | Show current workspace + destination page; buttons to change page, disconnect, or manage reminders |
 | `/disconnect` | Remove your Notion connection from the bot |
+
+**Reminders (via `/settings` → ⏰ Reminders):**
+
+- **Daily reminder** — sent at 9am your local time; lists the notes you captured the previous day
+- **Weekly reminder** — sent Monday at 9am your local time; lists notes from the previous week (Mon–Sun)
+- Both reminders are enabled by default and can be toggled on/off from the ⏰ Reminders submenu in `/settings`
+- If 0 notes were captured, the bot still sends a gentle nudge to record something
+- Timezone defaults to UTC; see Known Limitations below
 
 ---
 
@@ -158,6 +168,16 @@ worker: python src/bot.py
 
 ---
 
+## Known Limitations
+
+- **Reminder timing**: The scheduler checks every hour, so reminders are sent within 60 minutes of 9am — not at exactly 9:00. This is acceptable for daily/weekly nudges.
+- **Timezone format**: Timezones must be set directly in the database in the format `UTC`, `UTC+4`, `UTC-5`, etc. There is no in-bot timezone setup UI yet (planned for Phase 6B).
+- **Weekly day**: Weekly reminders are always sent on Monday. Day-of-week customisation is planned for a future phase.
+- **Reminder time**: Reminders are always sent at 9am. Time-of-day customisation is planned for a future phase.
+- **Blocked user retry**: If a user blocks the bot, delivery failures are counted. After 7 consecutive failed deliveries, reminders are automatically disabled for that user to avoid repeated errors.
+
+---
+
 ## Testing
 
 No automated tests yet.
@@ -189,3 +209,16 @@ No automated tests yet.
 - [ ] Voice with action items ("I need to call John") → Action Items section appears in Notion
 - [ ] Voice with decisions ("We decided to use Railway") → Decisions section appears in Notion
 - [ ] Revoke Notion access from Notion settings → send voice → bot reports token expired, prompts /connect
+
+**Phase 6A (Reminders):**
+- [ ] Send `/settings` → "⏰ Reminders" button appears in keyboard
+- [ ] Click "⏰ Reminders" → reminder status screen shows daily ✅ and weekly ✅ enabled
+- [ ] Click "Daily: ON ✅" → status flips to OFF ❌, database updated
+- [ ] Click "Daily: OFF ❌" → status flips back to ON ✅
+- [ ] Click "Weekly: ON ✅" → status flips to OFF ❌
+- [ ] Click "« Back" → returns to main /settings view
+- [ ] Restart bot → reminder preferences persist (SQLite survives in-session)
+- [ ] With `time_zone = "UTC"` in DB and current UTC hour = 9 → daily reminder arrives in Telegram
+- [ ] With notes created yesterday → daily reminder lists them with titles and Notion URLs
+- [ ] With 0 notes yesterday → daily reminder sends "No ideas captured yesterday" message
+- [ ] On a Monday with UTC hour = 9 → weekly reminder also sent listing last week's notes

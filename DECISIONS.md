@@ -115,3 +115,35 @@ aiohttp is already a direct dependency — `notion.py` uses `aiohttp.ClientSessi
 ## Why polling and web server run in the same process
 
 The bot needs two concurrent long-running tasks: Telegram polling (outbound HTTP long-poll) and the aiohttp web server (inbound HTTP for the OAuth callback). Running them in the same asyncio event loop via `asyncio.gather` / `web.AppRunner` is simpler than two separate processes — no IPC, no message queues, no port coordination. python-telegram-bot 20.x exposes clean `async with` lifecycle hooks that compose naturally with aiohttp's runner. The only coupling point is `ptb_app` being passed into the OAuth callback handler so it can send Telegram messages after token exchange.
+
+---
+
+## Why send a reminder even when 0 notes were captured
+
+Skipping the reminder when there's nothing to show would mean users only hear from the bot when they're already engaged. The most valuable moment to nudge someone is precisely when they haven't captured anything — it's a gentle prompt to get started. The "0 notes" message is intentionally short and non-intrusive; it does not feel like a failure notification. Users who find even the nudge annoying can disable reminders entirely from `/settings`.
+
+---
+
+## Why a scheduled background loop (not on-demand or exact-time scheduling)
+
+A `while True: ... await asyncio.sleep(3600)` loop in an asyncio task is the simplest correct implementation for this problem. It requires no external scheduler (Celery, APScheduler, cron), no additional process, no Redis broker, and no new dependencies — the reminder scheduler runs in the same event loop as the bot and the OAuth server.
+
+Exact-time scheduling (sleeping until the next 9:00:00 boundary) would add complexity with little benefit: daily and weekly reminders are not time-sensitive to the minute. A 1-hour granularity means users get their reminder anywhere between 9:00 and 9:59 local time, which is entirely acceptable for a "morning nudge" product. If exact delivery times become a product requirement, the sleep logic can be updated without changing anything else.
+
+---
+
+## Why 7 failed deliveries before disabling reminders
+
+Seven days of consecutive failures is a reasonable signal that the user has blocked the bot and is not coming back. Fewer retries (e.g. 3) risks disabling reminders for users who temporarily lose connectivity or have a short Telegram outage. More retries means failed API calls accumulate for blocked users indefinitely. Seven aligns with "one week of daily attempts" — a natural unit — and keeps the failure window bounded. If the user reconnects and interacts with the bot, the failure counter is reset on the next successful delivery.
+
+---
+
+## Why UTC as the default timezone (not asking during setup)
+
+Asking for timezone during the `/connect` or first-run flow adds friction to the most important moment: getting the user connected and sending their first voice note. UTC is a safe, unambiguous default — users in UTC+0 and those who haven't noticed the feature get sensible behaviour. Users who care about receiving reminders at exactly 9am local time can set their timezone directly in the database. A proper in-bot timezone picker is planned for a future phase (6B) once the reminder feature is proven useful.
+
+---
+
+## Why Monday for the weekly reminder (not user-configurable)
+
+Monday morning is the canonical "start of the work week" across most cultures and is the most natural time to review what you captured last week and set intentions for the coming week. Offering day-of-week selection adds a settings screen, a DB column, and UI complexity for a feature that is still unproven. The weekly reminder is already opt-in; users who want a different day can disable it. If demand for customisation emerges, it is a straightforward addition to the `/settings` reminders submenu.

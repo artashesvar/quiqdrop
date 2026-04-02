@@ -92,6 +92,8 @@ async def structure_transcript(transcript: str) -> dict:
     if not response.content:
         raise StructuringError("Empty response from API")
     raw = response.content[0].text.strip()
+    # Defensive strip: Claude occasionally wraps output in ```json fences despite the prompt
+    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     logger.debug("Raw structuring response: %s", raw)
 
     try:
