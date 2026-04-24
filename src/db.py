@@ -1,11 +1,12 @@
 # User config storage — async SQLite via aiosqlite
-# NOTE: DB lives at /tmp/quiqdrop.db — ephemeral on Railway (resets on redeploy).
-# All users must re-authorise after a deploy. Acceptable for MVP.
-# Migrate to persistent storage (e.g. Railway PostgreSQL) in a later phase.
+# DB lives at /data/quiqdrop.db — persisted via Railway volume.
 from __future__ import annotations
 import logging
+import time
 import typing
 import aiosqlite
+
+import src.config as config
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +19,9 @@ class ReminderUser(typing.NamedTuple):
     notion_access_token: str
     parent_page_id: str | None
 
-_DB_PATH = "/tmp/quiqdrop.db"
+_DB_PATH = config.DB_PATH
 
-_CREATE_TABLE = """
+_CREATE_USERS_TABLE = """
 CREATE TABLE IF NOT EXISTS users (
     telegram_user_id        INTEGER PRIMARY KEY,
     notion_access_token     TEXT    NOT NULL,
@@ -39,6 +40,16 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """
 
+# OAuth state tokens — persisted so bot restarts don't invalidate in-progress flows.
+# expires_at is a Unix timestamp (INTEGER). Rows are deleted on pop or eviction.
+_CREATE_PENDING_OAUTH_TABLE = """
+CREATE TABLE IF NOT EXISTS pending_oauth (
+    state           TEXT    PRIMARY KEY,
+    telegram_user_id INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL
+)
+"""
+
 # Applied one at a time; each is silently skipped if the column already exists.
 _MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN time_zone TEXT NOT NULL DEFAULT 'UTC'",
@@ -49,9 +60,10 @@ _MIGRATIONS = [
 
 
 async def init_db() -> None:
-    """Create users table if it doesn't exist, then apply column migrations. Call once at bot startup."""
+    """Create all tables if they don't exist, then apply column migrations. Call once at bot startup."""
     async with aiosqlite.connect(_DB_PATH) as db:
-        await db.execute(_CREATE_TABLE)
+        await db.execute(_CREATE_USERS_TABLE)
+        await db.execute(_CREATE_PENDING_OAUTH_TABLE)
         await db.commit()
         for migration in _MIGRATIONS:
             try:
@@ -61,6 +73,53 @@ async def init_db() -> None:
                 # Column already exists — safe to ignore.
                 pass
     logger.info("Database initialised at %s", _DB_PATH)
+
+
+_OAUTH_TTL_SEC = 3600  # 1 hour — plenty of time to complete the OAuth flow
+
+
+async def save_oauth_state(state: str, user_id: int) -> None:
+    """Persist an OAuth state token mapped to a Telegram user ID."""
+    expires_at = int(time.time()) + _OAUTH_TTL_SEC
+    async with aiosqlite.connect(_DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO pending_oauth (state, telegram_user_id, expires_at) VALUES (?, ?, ?)",
+            (state, user_id, expires_at),
+        )
+        await db.commit()
+
+
+async def pop_oauth_state(state: str) -> int | None:
+    """
+    Remove and return the Telegram user ID for the given state token.
+    Returns None if not found or already expired.
+    """
+    async with aiosqlite.connect(_DB_PATH) as db:
+        async with db.execute(
+            "SELECT telegram_user_id, expires_at FROM pending_oauth WHERE state = ?",
+            (state,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        await db.execute("DELETE FROM pending_oauth WHERE state = ?", (state,))
+        await db.commit()
+    user_id, expires_at = row
+    if int(time.time()) > expires_at:
+        return None
+    return user_id
+
+
+async def evict_stale_oauth_states() -> None:
+    """Delete all expired OAuth state rows. Call periodically to keep the table clean."""
+    async with aiosqlite.connect(_DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM pending_oauth WHERE expires_at < ?",
+            (int(time.time()),),
+        )
+        await db.commit()
+        if cursor.rowcount:
+            logger.debug("Evicted %d stale OAuth state(s)", cursor.rowcount)
 
 
 async def save_user_token(user_id: int, token: str, workspace_name: str) -> None:

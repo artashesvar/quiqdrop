@@ -5,7 +5,6 @@ import logging
 import os
 import secrets
 import sys
-import time
 from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,10 +24,13 @@ import src.config as config
 from src.reminder_scheduler import reminder_scheduler_loop
 from src.db import (
     delete_user_config,
+    evict_stale_oauth_states,
     get_reminder_preferences,
     get_user_config,
     get_workspace_name,
     init_db,
+    pop_oauth_state,
+    save_oauth_state,
     save_parent_page,
     save_user_token,
     update_reminder_preferences,
@@ -58,22 +60,6 @@ logger = logging.getLogger(__name__)
 
 # Suppress httpx INFO logs — they contain the full bot token in the URL
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-# Maps random hex state token → (telegram_user_id, created_at_monotonic).
-# In-memory: resets on restart (user clicks /connect again — acceptable for MVP).
-# Stale entries (abandoned flows) are evicted by _evict_stale_oauth() called on each /connect.
-_OAUTH_TTL_SEC = 3600  # 1 hour — plenty of time to complete the OAuth flow
-_pending_oauth: dict[str, tuple[int, float]] = {}
-
-
-def _evict_stale_oauth() -> None:
-    """Remove OAuth state entries older than _OAUTH_TTL_SEC (abandoned flows)."""
-    cutoff = time.monotonic() - _OAUTH_TTL_SEC
-    stale = [s for s, (_, ts) in _pending_oauth.items() if ts < cutoff]
-    for s in stale:
-        del _pending_oauth[s]
-    if stale:
-        logger.debug("Evicted %d stale OAuth state(s)", len(stale))
 
 # Tracks users currently processing a voice note — prevents concurrent API hammering.
 # Removed from the set in handle_voice's finally block.
@@ -231,9 +217,9 @@ async def connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     logger.info("User %s initiated /connect", user.id)
 
-    _evict_stale_oauth()
+    await evict_stale_oauth_states()
     state = secrets.token_hex(16)
-    _pending_oauth[state] = (user.id, time.monotonic())
+    await save_oauth_state(state, user.id)
 
     url = _build_oauth_url(state)
     keyboard = InlineKeyboardMarkup([
@@ -651,8 +637,7 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
             status=400,
         )
 
-    entry = _pending_oauth.pop(state, None)
-    user_id = entry[0] if entry is not None else None
+    user_id = await pop_oauth_state(state)
     if user_id is None:
         logger.warning("OAuth callback received unknown state: %s", state)
         return web.Response(
