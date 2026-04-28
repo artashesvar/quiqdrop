@@ -25,13 +25,13 @@ async def transcribe_audio(file_path: str) -> str:
     audio_bytes = await asyncio.to_thread(_read_file, file_path)
     filename = os.path.basename(file_path)
 
-    # Whisper API can silently hang on unusual audio — 60s covers even a 5-min note
+    # Whisper API can silently hang on unusual audio — 180s matches the 3-min max audio duration
     response = await asyncio.wait_for(
         _client.audio.transcriptions.create(
             model=config.WHISPER_MODEL,
             file=(filename, audio_bytes),
         ),
-        timeout=60.0,
+        timeout=180.0,
     )
 
     transcript = response.text

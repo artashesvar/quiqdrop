@@ -49,7 +49,7 @@ from src.structure import StructuringError, structure_transcript
 from src.text_cleaner import clean_transcript
 from src.transcribe import transcribe_audio
 
-_MAX_VOICE_DURATION_SEC = 300    # 5 minutes — beyond this Whisper quality degrades
+_MAX_VOICE_DURATION_SEC = 180    # 3 minutes — notes beyond this are trimmed to first 3 min
 _MAX_VOICE_SIZE_BYTES = 20 * 1024 * 1024  # 20MB — Whisper hard limit is 25MB
 
 logging.basicConfig(
@@ -181,6 +181,21 @@ def _format_structured(data: dict) -> str:
             parts.append(f"• {decision}")
 
     return "\n".join(parts)
+
+
+def _do_trim(src: str, dst: str, max_ms: int) -> None:
+    """Synchronous pydub trim — called via asyncio.to_thread."""
+    from pydub import AudioSegment
+    audio = AudioSegment.from_file(src)
+    audio[:max_ms].export(dst, format="ogg")
+
+
+async def _trim_audio(src_path: str, max_sec: int) -> str:
+    """Trim audio file to max_sec seconds. Returns path to trimmed file."""
+    dst_path = src_path.replace(".ogg", "_trimmed.ogg")
+    await asyncio.to_thread(_do_trim, src_path, dst_path, max_sec * 1000)
+    logger.info("Trimmed audio from %s to %ds → %s", src_path, max_sec, dst_path)
+    return dst_path
 
 
 # ---------------------------------------------------------------------------
@@ -486,11 +501,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if user.id in _processing_users:
         await update.message.reply_text(
-            "Still processing your previous note — please wait a moment before sending another."
+            "⏳ Your previous recording is still processing, please wait."
         )
         return
 
     file_path = f"/tmp/voice_{user.id}_{file_unique_id}.ogg"
+    trimmed_path: str | None = None
     _processing_users.add(user.id)
     try:
         # Auth check before doing any work
@@ -507,6 +523,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
+        is_trimmed = duration > _MAX_VOICE_DURATION_SEC
+        if is_trimmed:
+            await update.message.reply_text(
+                f"⚠️ Your note is over 3 min — I'll process the first 3 min only..."
+            )
+
         voice_file = await update.message.voice.get_file()
         await voice_file.download_to_drive(file_path)
         file_size = os.path.getsize(file_path)
@@ -519,8 +541,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
+        process_path = file_path
+        if is_trimmed:
+            trimmed_path = await _trim_audio(file_path, _MAX_VOICE_DURATION_SEC)
+            process_path = trimmed_path
+
         await update.message.reply_text("Transcribing your voice note...")
-        transcript = await transcribe_audio(file_path)
+        transcript = await transcribe_audio(process_path)
 
         # Whisper returns empty string for silence, pure noise, or sub-second clips
         if not transcript.strip():
@@ -547,8 +574,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Save to Notion
         try:
             _, page_url = await create_page(token, parent_page_id, structured, transcript)
+            saved_line = "✅ Saved to Notion - only the first 3 min!" if is_trimmed else "✅ Saved to Notion!"
             await update.message.reply_text(
-                f"✅ Saved to Notion!\n\n"
+                f"{saved_line}\n\n"
                 f"📄 {structured['title']}\n\n"
                 f"{structured['summary']}\n\n"
                 f"[{_truncate_url(page_url)}]({page_url})",
@@ -587,6 +615,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if os.path.exists(file_path):
             os.remove(file_path)
             logger.info("Cleaned up %s", file_path)
+        if trimmed_path and os.path.exists(trimmed_path):
+            os.remove(trimmed_path)
+            logger.info("Cleaned up %s", trimmed_path)
 
 
 # ---------------------------------------------------------------------------
