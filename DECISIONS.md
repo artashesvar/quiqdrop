@@ -18,19 +18,19 @@ python-telegram-bot 20.x is fully async, actively maintained, and has comprehens
 
 ## Why GitHub
 
-Standard choice. Railway integrates directly with GitHub for automatic deploys on push — no CI/CD config needed.
+Standard choice. Coolify integrates directly with GitHub for automatic deploys on push — no CI/CD config needed.
 
 ---
 
-## Why Railway (not Heroku, Fly.io, AWS, etc.)
+## Why Hetzner + Coolify (not Railway, Heroku, Fly.io, AWS, etc.)
 
-Heroku killed its free tier in 2022 and is now more expensive than Railway for the same specs. Fly.io is excellent but requires Docker and more ops overhead for what is a single-process bot. AWS is complete overkill for an MVP that runs one Python process. Railway deploys directly from GitHub, exposes env vars cleanly, and has a usable free trial. Good enough for Phases 0-5.
+Railway was the original host but its free trial ended after 30 days with no sustainable free tier. Hetzner CX22 at €4.49/month is cheaper than any comparable PaaS. Coolify runs on the Hetzner VPS and provides Railway-like DX: GitHub auto-deploy on push, env vars UI, build logs, and domain + SSL management — all self-hosted. Fly.io is excellent but requires Docker and more ops overhead. AWS is overkill for a single-process bot. Heroku killed its free tier in 2022 and is now more expensive. Hetzner + Coolify gives the best price-to-DX ratio for a long-running MVP.
 
 ---
 
 ## Why polling (not webhooks)
 
-Webhooks require a stable public HTTPS URL and TLS termination. Polling works from a laptop, a Railway worker dyno, or anywhere else — zero URL config. The latency difference is irrelevant here: polling checks every second, but voice note processing takes 5-12 seconds anyway, so the extra second is invisible to users. When user volume grows into the thousands, reconsider webhooks. For an MVP, polling is zero-friction.
+Webhooks require a stable public HTTPS URL and TLS termination. Polling works from a laptop, a Hetzner VPS, or anywhere else — zero URL config. The latency difference is irrelevant here: polling checks every second, but voice note processing takes 5-12 seconds anyway, so the extra second is invisible to users. When user volume grows into the thousands, reconsider webhooks. For an MVP, polling is zero-friction.
 
 ---
 
@@ -46,9 +46,9 @@ Whisper handles non-native English, mumbling, and background noise better than a
 
 ---
 
-## Why /tmp for voice file storage on Railway
+## Why /tmp for voice file storage
 
-Railway worker dynos have ephemeral local storage at `/tmp`. The audio file only needs to exist for the duration of one Whisper API call — roughly 2-6 seconds. Uploading to S3 or a database before transcribing would add latency, cost, and complexity for zero benefit, since the file is always deleted immediately after transcription. Risk: if the process is killed mid-transcription, the file leaks temporarily — but `/tmp` is cleared on dyno restart regardless.
+The audio file only needs to exist for the duration of one Whisper API call — roughly 2-6 seconds. Uploading to S3 or a database before transcribing would add latency, cost, and complexity for zero benefit, since the file is always deleted immediately after transcription. `/tmp` is ephemeral by design and the right tool for short-lived scratch files. Risk: if the process is killed mid-transcription, the file leaks temporarily — but it is small and will be cleaned up on the next server restart.
 
 ---
 
@@ -96,13 +96,13 @@ Internal Notion integrations are scoped to a single workspace — the one the de
 
 ## Why SQLite + aiosqlite (not Postgres, Redis, etc.)
 
-The bot runs as a single process on one Railway worker dyno. There is no horizontal scaling, no need for cross-process shared state, and no concurrent writes that would stress SQLite's locking model. aiosqlite wraps SQLite with an async interface so database calls never block the event loop. Adding Postgres would require a second Railway service, connection pooling, and a migration story — none of which add value at MVP scale. Revisit when user count or deployment architecture changes.
+The bot runs as a single process on one Hetzner VPS. There is no horizontal scaling, no need for cross-process shared state, and no concurrent writes that would stress SQLite's locking model. aiosqlite wraps SQLite with an async interface so database calls never block the event loop. Adding Postgres would require a separate managed service, connection pooling, and a migration story — none of which add value at MVP scale. Revisit when user count or deployment architecture changes.
 
 ---
 
-## Why /tmp for the SQLite database on Railway
+## Why /data for the SQLite database
 
-Railway worker dynos have ephemeral local storage at `/tmp`. The trade-off is that the database resets on every redeploy, so all users must re-authorise after a deployment. This is acceptable for an MVP — users are informed by the bot when their token is expired and reconnecting takes 30 seconds. The alternative (Railway's persistent PostgreSQL add-on) adds cost and infra complexity for a problem that barely exists at current scale.
+The DB lives at `/data/quiqdrop.db` on the Hetzner server disk, which is persistent across redeploys and restarts — unlike `/tmp` which is ephemeral. The path is configurable via the `DB_PATH` env var (defaults to `/data/quiqdrop.db` in production; set `DB_PATH=/tmp/quiqdrop.db` in `.env` for local dev). This means users never need to re-authorise after a deployment.
 
 ---
 

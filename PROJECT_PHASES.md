@@ -65,7 +65,7 @@ Use this as a reference for understanding the project architecture or building s
 ## Phase 5 — Ship It and Survive Real Use
 
 **Steps:**
-1. Host the bot — put it on a real server so it runs 24/7 (Railway, Heroku, etc.)
+1. Host the bot — running on Hetzner VPS managed via Coolify (auto-deploy from GitHub)
 2. Test edge cases — break it on purpose, fix what breaks
 3. Use it daily — actually capture thoughts with it
 

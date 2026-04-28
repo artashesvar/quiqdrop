@@ -112,7 +112,8 @@ PORT=8080
 [x] requirements.txt created
 [x] .env file created (not committed)
 [x] First push to GitHub done
-[ ] Notion public integration created (get CLIENT_ID + CLIENT_SECRET)
-[ ] NOTION_REDIRECT_URI confirmed (Railway URL or ngrok for local dev)
-[ ] src/ files implemented
-[ ] End-to-end test: voice note → Notion page
+[x] Notion public integration created (get CLIENT_ID + CLIENT_SECRET)
+[x] NOTION_REDIRECT_URI confirmed (Hetzner domain via Coolify)
+[x] src/ files implemented
+[x] End-to-end test: voice note → Notion page
+[x] Deployed to Hetzner VPS via Coolify (auto-deploy on push to main)
