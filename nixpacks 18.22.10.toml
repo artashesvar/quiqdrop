@@ -1,5 +1,0 @@
-# nixpacks.toml — tells Railway's build system to install system packages.
-# ffmpeg is required to process audio files (used by pydub under the hood).
-
-[phases.setup]
-nixPkgs = ["ffmpeg", "python311"]
