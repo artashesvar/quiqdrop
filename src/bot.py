@@ -244,12 +244,8 @@ async def connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await save_oauth_state(state, user.id)
 
     url = _build_oauth_url(state)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Connect Notion Workspace", url=url)]
-    ])
     await update.message.reply_text(
-        "Click below to connect your Notion workspace:",
-        reply_markup=keyboard,
+        f"Tap the link below to connect your Notion workspace:\n\n{url}"
     )
 
 
