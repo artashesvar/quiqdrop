@@ -761,7 +761,31 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
 
     if pages:
         keyboard = _build_parent_keyboard(user_id, pages)
-        if keyboard.inline_keyboard:
+        top_level = keyboard.inline_keyboard
+        if len(top_level) == 1:
+            # Only one page shared — auto-select it, no picker needed.
+            short_id = int(top_level[0][0].callback_data.split(":")[1])
+            cached = _page_cache.get(user_id, {}).get(short_id)
+            if cached:
+                await save_parent_page(user_id, cached["id"])
+                await ptb_app.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"Connected to *{workspace_name}* 🎉\n\n"
+                        f"Your notes will be saved to *{cached['title']}*\n\n"
+                        "Send me a voice note anytime 🎤"
+                    ),
+                    parse_mode="Markdown",
+                )
+            else:
+                # Cache miss — fall back to picker
+                await ptb_app.bot.send_message(
+                    chat_id=user_id,
+                    text=f"Connected to *{workspace_name}* 🎉\n\nNow choose where to save your notes:",
+                    parse_mode="Markdown",
+                    reply_markup=keyboard,
+                )
+        elif top_level:
             await ptb_app.bot.send_message(
                 chat_id=user_id,
                 text=f"Connected to *{workspace_name}* 🎉\n\nNow choose where to save your notes:",
