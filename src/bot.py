@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from aiohttp import web
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -512,8 +512,26 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             trimmed_path = await _trim_audio(file_path, _MAX_VOICE_DURATION_SEC)
             process_path = trimmed_path
 
-        await update.message.reply_text("Transcribing your voice note...")
-        transcript = await transcribe_audio(process_path)
+        progress_msg = await update.message.reply_text(
+            "Turning your thoughts into text... ✍️ hang tight!"
+        )
+
+        async def _gem_nudge(msg: Message) -> None:
+            await asyncio.sleep(10)
+            try:
+                await msg.edit_text(
+                    "Turning your thoughts into text... ✍️ hang tight!\n\n"
+                    "Wait, you're dropping gems! 💎 Need a few more seconds. "
+                    "Don't want to miss a single one."
+                )
+            except Exception:
+                pass
+
+        gem_task = asyncio.create_task(_gem_nudge(progress_msg))
+        try:
+            transcript = await transcribe_audio(process_path)
+        finally:
+            gem_task.cancel()
 
         # Whisper returns empty string for silence, pure noise, or sub-second clips
         if not transcript.strip():
@@ -528,7 +546,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             logger.info("Cleaning: %d→%d chars", before_len, len(transcript))
 
         if config.ENABLE_AI_STRUCTURING:
-            await update.message.reply_text("Structuring your note...")
+            await update.message.reply_text("Extracting the key points for you.")
             try:
                 structured = await structure_transcript(transcript)
             except StructuringError as e:
@@ -538,6 +556,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             structured = {"title": "Voice note", "summary": transcript, "key_points": []}
 
         # Save to Notion
+        await update.message.reply_text("Sending this straight to your Notion... 🧠")
         try:
             page_id, page_url = await create_page(token, parent_page_id, structured, transcript)
             _last_note_page[user.id] = page_id
