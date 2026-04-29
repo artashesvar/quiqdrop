@@ -775,7 +775,7 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
         elif top_level:
             await ptb_app.bot.send_message(
                 chat_id=user_id,
-                text=f"Connected to *{workspace_name}* 🎉\n\nNow choose where to save your notes:",
+                text=f"Connected to *{workspace_name}* 🎉\n\nYou shared more than 1 page. Pick the one as your final destination.",
                 parse_mode="Markdown",
                 reply_markup=keyboard,
             )
