@@ -553,7 +553,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not page_id:
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(
-                "No recent note found. Send a voice note first."
+                "This note is too old to attach a URL."
             )
             return
         _pending_url[user.id] = (page_id, time.monotonic() + _PENDING_URL_TTL_SEC)
