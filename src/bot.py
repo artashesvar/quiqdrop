@@ -248,7 +248,11 @@ async def connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("Connect to Notion", url=url)]
     ])
     await update.message.reply_text(
-        "Click below to connect your Notion workspace:",
+        "Click below to connect your Notion workspace:\n\n"
+        "📱 *Android users:* if the button opens the Notion app instead of the auth page, "
+        "go to your phone's Settings → Apps → Notion → \"Open by default\" → clear defaults. "
+        "Then try again.",
+        parse_mode="Markdown",
         reply_markup=keyboard,
     )
 
