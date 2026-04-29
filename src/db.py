@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS users (
     notion_access_token     TEXT    NOT NULL,
     workspace_name          TEXT    NOT NULL,
     parent_page_id          TEXT,
+    parent_page_title       TEXT,
     -- Phase 6A: reminder preferences. time_zone format: "UTC", "UTC+4", "UTC-5".
     -- BOOLEAN stored as INTEGER (1/0) — SQLite has no native BOOLEAN type.
     -- reminder_failed_count increments on each delivery failure; resets on success.
@@ -56,6 +57,7 @@ _MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN daily_reminder_enabled INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE users ADD COLUMN weekly_reminder_enabled INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE users ADD COLUMN reminder_failed_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN parent_page_title TEXT",
 ]
 
 
@@ -144,16 +146,17 @@ async def save_user_token(user_id: int, token: str, workspace_name: str) -> None
     logger.info("Saved token for user %s (workspace: %s)", user_id, workspace_name)
 
 
-async def save_parent_page(user_id: int, page_id: str) -> None:
+async def save_parent_page(user_id: int, page_id: str, page_title: str = "") -> None:
     """Update the destination page for an existing user."""
     async with aiosqlite.connect(_DB_PATH) as db:
         cursor = await db.execute(
             """
             UPDATE users
-            SET parent_page_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            SET parent_page_id = ?, parent_page_title = ?,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             WHERE telegram_user_id = ?
             """,
-            (page_id, user_id),
+            (page_id, page_title, user_id),
         )
         await db.commit()
         if cursor.rowcount == 0:
@@ -162,21 +165,21 @@ async def save_parent_page(user_id: int, page_id: str) -> None:
             logger.info("Saved parent page for user %s: %s", user_id, page_id)
 
 
-async def get_user_config(user_id: int) -> tuple[str, str | None] | None:
+async def get_user_config(user_id: int) -> tuple[str, str | None, str | None] | None:
     """
-    Return (notion_access_token, parent_page_id) for the user,
+    Return (notion_access_token, parent_page_id, parent_page_title) for the user,
     or None if the user has not connected their workspace.
-    parent_page_id may be None if the user hasn't selected a page yet.
+    parent_page_id / parent_page_title may be None if no page selected yet.
     """
     async with aiosqlite.connect(_DB_PATH) as db:
         async with db.execute(
-            "SELECT notion_access_token, parent_page_id FROM users WHERE telegram_user_id = ?",
+            "SELECT notion_access_token, parent_page_id, parent_page_title FROM users WHERE telegram_user_id = ?",
             (user_id,),
         ) as cursor:
             row = await cursor.fetchone()
     if row is None:
         return None
-    return row[0], row[1]
+    return row[0], row[1], row[2]
 
 
 async def get_workspace_name(user_id: int) -> str | None:

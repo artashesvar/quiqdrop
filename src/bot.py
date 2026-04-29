@@ -215,13 +215,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     config_row = await get_user_config(user.id)
     if config_row is not None:
-        _, page_id = config_row
-        page_status = "selected ✅" if page_id else "not selected yet — use /settings"
+        _, page_id, page_title = config_row
+        page_status = f"*{page_title}*" if page_title else ("selected ✅" if page_id else "not selected yet — use /settings")
         await update.message.reply_text(
             f"Welcome back, {user.first_name}! 👋\n\n"
             f"Your Notion workspace is connected.\n"
             f"Destination page: {page_status}\n\n"
-            "Send me a voice note anytime 🎤"
+            "Send me a voice note anytime 🎤",
+            parse_mode="Markdown",
         )
     else:
         await update.message.reply_text(
@@ -262,14 +263,11 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    _, page_id = config_row
+    _, page_id, page_title = config_row
     workspace = await get_workspace_name(user.id) or "Notion"
-    page_display = "Selected ✅" if page_id else "_not selected yet_"
+    page_display = f"*{page_title}*" if page_title else ("Selected ✅" if page_id else "_not selected yet_")
     keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Change Page", callback_data="change_page"),
-            InlineKeyboardButton("Disconnect", callback_data="disconnect_confirm_prompt"),
-        ],
+        [InlineKeyboardButton("Disconnect", callback_data="disconnect_confirm_prompt")],
         [InlineKeyboardButton("⏰ Reminders", callback_data="settings_reminders")],
     ])
     await update.message.reply_text(
@@ -343,39 +341,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text("Session expired. Use /settings to pick a page again.")
             return
         page_id, page_title = cached["id"], cached["title"]
-        await save_parent_page(user.id, page_id)
+        await save_parent_page(user.id, page_id, page_title)
         logger.info("User %s selected page %s (%s)", user.id, page_id, page_title)
         await query.edit_message_text(
             f"✅ All set! Your notes will be saved to *{page_title}*\n\n"
             "Send me a voice note anytime 🎤",
             parse_mode="Markdown",
-        )
-
-    elif data == "change_page":
-        config_row = await get_user_config(user.id)
-        if config_row is None:
-            await query.edit_message_text("You're not connected. Use /connect first.")
-            return
-        token, _ = config_row
-        try:
-            pages = await search_pages(token)
-        except NotionError as e:
-            logger.error("search_pages failed for user %s: %s", user.id, e)
-            await query.edit_message_text("Couldn't fetch pages from Notion. Please try again.")
-            return
-        if not pages:
-            await query.edit_message_text(
-                "No pages found. Share at least one page with the QuiqDrop integration in Notion, "
-                "then try again."
-            )
-            return
-        keyboard = _build_parent_keyboard(user.id, pages)
-        if not keyboard.inline_keyboard:
-            await query.edit_message_text(_NO_TOP_LEVEL_MSG)
-            return
-        await query.edit_message_text(
-            "Now choose where to save your notes:",
-            reply_markup=keyboard,
         )
 
     elif data == "disconnect_confirm_prompt":
@@ -434,14 +405,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if config_row is None:
             await query.edit_message_text("No Notion workspace connected. Use /connect.")
             return
-        _, page_id = config_row
+        _, page_id, page_title = config_row
         workspace = await get_workspace_name(user.id) or "Notion"
-        page_display = "Selected ✅" if page_id else "_not selected yet_"
+        page_display = f"*{page_title}*" if page_title else ("Selected ✅" if page_id else "_not selected yet_")
         keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Change Page", callback_data="change_page"),
-                InlineKeyboardButton("Disconnect", callback_data="disconnect_confirm_prompt"),
-            ],
+            [InlineKeyboardButton("Disconnect", callback_data="disconnect_confirm_prompt")],
             [InlineKeyboardButton("⏰ Reminders", callback_data="settings_reminders")],
         ])
         await query.edit_message_text(
@@ -514,7 +482,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "You need to connect your Notion workspace first.\nUse /connect to get started."
             )
             return
-        token, parent_page_id = config_row
+        token, parent_page_id, _ = config_row
         if not parent_page_id:
             await update.message.reply_text(
                 "You haven't selected a destination page yet.\nUse /settings to choose one."
@@ -661,7 +629,7 @@ async def handle_pending_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "You need to connect your Notion workspace first.\nUse /connect to get started."
         )
         return
-    token, _ = config_row
+    token, _, _2 = config_row
 
     try:
         await append_url_block(token, page_id, url_text)
@@ -767,7 +735,7 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
             short_id = int(top_level[0][0].callback_data.split(":")[1])
             cached = _page_cache.get(user_id, {}).get(short_id)
             if cached:
-                await save_parent_page(user_id, cached["id"])
+                await save_parent_page(user_id, cached["id"], cached["title"])
                 await ptb_app.bot.send_message(
                     chat_id=user_id,
                     text=(
