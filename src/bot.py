@@ -344,7 +344,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await save_parent_page(user.id, page_id, page_title)
         logger.info("User %s selected page %s (%s)", user.id, page_id, page_title)
         await query.edit_message_text(
-            f"✅ All set! Your notes will be saved to *{page_title}*\n\n"
+            f"✅ All set! Your notes will be saved to 👉 *{page_title}*\n\n"
             "Send me a voice note anytime 🎤",
             parse_mode="Markdown",
         )
@@ -759,7 +759,7 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
                     chat_id=user_id,
                     text=(
                         f"Connected to *{workspace_name}* 🎉\n\n"
-                        f"Your notes will be saved to *{cached['title']}*\n\n"
+                        f"Your notes will be saved to 👉 *{cached['title']}*\n\n"
                         "Send me a voice note anytime 🎤"
                     ),
                     parse_mode="Markdown",
