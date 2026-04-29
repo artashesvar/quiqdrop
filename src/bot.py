@@ -492,13 +492,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file_unique_id = update.message.voice.file_unique_id
     logger.info("Voice from user %s | duration=%ds", user.id, duration)
 
-    # Reject before downloading — saves bandwidth and API costs
-    if duration > _MAX_VOICE_DURATION_SEC:
-        await update.message.reply_text(
-            f"Voice note is too long ({duration}s). Please keep it under 5 minutes."
-        )
-        return
-
     if user.id in _processing_users:
         await update.message.reply_text(
             "⏳ Your previous recording is still processing, please wait."
