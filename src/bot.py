@@ -83,7 +83,7 @@ _TIMEZONE_OPTIONS: list[tuple[str, str]] = [
     ("🌍 Paris / Berlin (UTC+1)", "UTC+1"),
     ("🌍 Helsinki / Cairo (UTC+2)", "UTC+2"),
     ("🌍 Moscow / Nairobi (UTC+3)", "UTC+3"),
-    ("🌍 Dubai / Baku (UTC+4)", "UTC+4"),
+    ("🌍 Dubai (UTC+4)", "UTC+4"),
     ("🌏 Karachi (UTC+5)", "UTC+5"),
     ("🌏 Dhaka / Almaty (UTC+6)", "UTC+6"),
     ("🌏 Bangkok / Jakarta (UTC+7)", "UTC+7"),
