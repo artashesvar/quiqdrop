@@ -577,6 +577,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file_unique_id = update.message.voice.file_unique_id
     logger.info("Voice from user %s | duration=%ds", user.id, duration)
 
+    if duration < 3:
+        await update.message.reply_text("That voice clip was a little too short! ⚠️")
+        return
+
     if user.id in _processing_users:
         await update.message.reply_text(
             "⏳ Your previous recording is still processing, please wait."
