@@ -35,6 +35,7 @@ from src.db import (
     save_parent_page,
     save_user_token,
     update_reminder_preferences,
+    update_timezone,
 )
 from src.notion import (
     NotionError,
@@ -75,6 +76,26 @@ _last_note_page: dict[int, str] = {}
 # Cleared on URL received, /cancel, timeout, or new voice note.
 _pending_url: dict[int, tuple[str, float]] = {}
 _PENDING_URL_TTL_SEC = 300  # 5 minutes
+
+# City-labelled timezone options — maps display label to UTC offset string stored in DB.
+# "UTC" (no suffix) is reserved as the "never been set" sentinel; genuine UTC users get "UTC+0".
+_TIMEZONE_OPTIONS: list[tuple[str, str]] = [
+    ("🌍 London (UTC+0)", "UTC+0"),
+    ("🌍 Paris / Berlin (UTC+1)", "UTC+1"),
+    ("🌍 Helsinki / Cairo (UTC+2)", "UTC+2"),
+    ("🌍 Moscow / Nairobi (UTC+3)", "UTC+3"),
+    ("🌍 Dubai / Baku (UTC+4)", "UTC+4"),
+    ("🌏 Karachi (UTC+5)", "UTC+5"),
+    ("🌏 Dhaka / Almaty (UTC+6)", "UTC+6"),
+    ("🌏 Bangkok / Jakarta (UTC+7)", "UTC+7"),
+    ("🌏 Singapore / Beijing (UTC+8)", "UTC+8"),
+    ("🌏 Tokyo / Seoul (UTC+9)", "UTC+9"),
+    ("🌏 Sydney (UTC+10)", "UTC+10"),
+    ("🌎 New York (UTC-5)", "UTC-5"),
+    ("🌎 Chicago (UTC-6)", "UTC-6"),
+    ("🌎 Denver (UTC-7)", "UTC-7"),
+    ("🌎 Los Angeles (UTC-8)", "UTC-8"),
+]
 
 # Page selection cache — maps short integer IDs to Notion page info per user.
 # Populated on each page fetch; resets on next fetch or bot restart.
@@ -161,6 +182,21 @@ def _build_subpage_keyboard(
         buttons.append([InlineKeyboardButton(f"  {sub['title'][:38]}", callback_data=f"page_select:{next_id}")])
         next_id += 1
     buttons.append([InlineKeyboardButton("← Back", callback_data="page_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _build_timezone_keyboard(pending_toggle: str) -> InlineKeyboardMarkup:
+    """
+    Build the timezone picker keyboard.
+    pending_toggle: 'daily' or 'weekly' — encoded in callback_data so we know
+    which reminder to enable after the user picks their timezone.
+    callback_data format: tz_select:{tz_value}:{pending_toggle}
+    Longest value: "tz_select:UTC+10:weekly" = 22 bytes (well within 64-byte limit).
+    """
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"tz_select:{tz}:{pending_toggle}")]
+        for label, tz in _TIMEZONE_OPTIONS
+    ]
     return InlineKeyboardMarkup(buttons)
 
 
@@ -455,17 +491,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif data == "toggle_daily":
         prefs = await get_reminder_preferences(user.id)
-        _, daily, _ = prefs if prefs else ("UTC", True, True)
-        await update_reminder_preferences(user.id, daily_enabled=not daily)
-        text, keyboard = await _build_reminder_settings(user.id)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        tz, daily, _ = prefs if prefs else ("UTC", False, False)
+        if not daily and tz == "UTC":
+            # Toggling ON for the first time and timezone never set — ask for timezone first
+            await query.edit_message_text(
+                "⏰ Before enabling reminders, let me know your timezone so I can send them at 9am your time:",
+                reply_markup=_build_timezone_keyboard("daily"),
+            )
+        else:
+            await update_reminder_preferences(user.id, daily_enabled=not daily)
+            text, keyboard = await _build_reminder_settings(user.id)
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
     elif data == "toggle_weekly":
         prefs = await get_reminder_preferences(user.id)
-        _, _, weekly = prefs if prefs else ("UTC", True, True)
-        await update_reminder_preferences(user.id, weekly_enabled=not weekly)
-        text, keyboard = await _build_reminder_settings(user.id)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        tz, _, weekly = prefs if prefs else ("UTC", False, False)
+        if not weekly and tz == "UTC":
+            # Toggling ON for the first time and timezone never set — ask for timezone first
+            await query.edit_message_text(
+                "⏰ Before enabling reminders, let me know your timezone so I can send them at 9am your time:",
+                reply_markup=_build_timezone_keyboard("weekly"),
+            )
+        else:
+            await update_reminder_preferences(user.id, weekly_enabled=not weekly)
+            text, keyboard = await _build_reminder_settings(user.id)
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
     elif data == "settings_back":
         config_row = await get_user_config(user.id)
@@ -487,6 +537,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="Markdown",
             reply_markup=keyboard,
         )
+
+    elif data.startswith("tz_select:"):
+        _, tz_value, pending_toggle = data.split(":", 2)
+        await update_timezone(user.id, tz_value)
+        if pending_toggle == "daily":
+            await update_reminder_preferences(user.id, daily_enabled=True)
+        else:
+            await update_reminder_preferences(user.id, weekly_enabled=True)
+        text, keyboard = await _build_reminder_settings(user.id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
     elif data == "add_url":
         page_id = _last_note_page.get(user.id)
