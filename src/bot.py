@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import sys
+import time
 from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,6 +41,7 @@ from src.notion import (
     NotionOAuthError,
     NotionPageNotFoundError,
     NotionUnauthorizedError,
+    append_url_block,
     create_page,
     exchange_token,
     fetch_child_pages,
@@ -64,6 +66,15 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # Tracks users currently processing a voice note — prevents concurrent API hammering.
 # Removed from the set in handle_voice's finally block.
 _processing_users: set[int] = set()
+
+# Maps user_id → page_id of the last successfully created note.
+# Cleared when user starts a new voice note.
+_last_note_page: dict[int, str] = {}
+
+# Maps user_id → (page_id, expires_at_monotonic) when awaiting a URL to attach.
+# Cleared on URL received, /cancel, timeout, or new voice note.
+_pending_url: dict[int, tuple[str, float]] = {}
+_PENDING_URL_TTL_SEC = 300  # 5 minutes
 
 # Page selection cache — maps short integer IDs to Notion page info per user.
 # Populated on each page fetch; resets on next fetch or bot restart.
@@ -477,6 +488,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=keyboard,
         )
 
+    elif data == "add_url":
+        page_id = _last_note_page.get(user.id)
+        if not page_id:
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text(
+                "No recent note found. Send a voice note first."
+            )
+            return
+        _pending_url[user.id] = (page_id, time.monotonic() + _PENDING_URL_TTL_SEC)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            "Send me the URL to add to your note, or /cancel to stop."
+        )
+
     else:
         logger.warning("handle_callback: unrecognised callback_data=%s from user %s", data, user.id)
 
@@ -497,6 +522,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "⏳ Your previous recording is still processing, please wait."
         )
         return
+
+    # Clear any prior attachment state — new voice note supersedes it
+    _last_note_page.pop(user.id, None)
+    _pending_url.pop(user.id, None)
 
     file_path = f"/tmp/voice_{user.id}_{file_unique_id}.ogg"
     trimmed_path: str | None = None
@@ -566,7 +595,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # Save to Notion
         try:
-            _, page_url = await create_page(token, parent_page_id, structured, transcript)
+            page_id, page_url = await create_page(token, parent_page_id, structured, transcript)
+            _last_note_page[user.id] = page_id
             saved_line = "✅ Saved to Notion - only the first 3 min!" if is_trimmed else "✅ Saved to Notion!"
             await update.message.reply_text(
                 f"{saved_line}\n\n"
@@ -575,6 +605,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"[{_truncate_url(page_url)}]({page_url})",
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 Add URL", callback_data="add_url")],
+                ]),
             )
         except NotionUnauthorizedError:
             logger.warning("Notion token expired for user %s", user.id)
@@ -611,6 +644,61 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if trimmed_path and os.path.exists(trimmed_path):
             os.remove(trimmed_path)
             logger.info("Cleaned up %s", trimmed_path)
+
+
+# ---------------------------------------------------------------------------
+# URL attachment handlers
+# ---------------------------------------------------------------------------
+
+async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /cancel — exit the URL attachment waiting state."""
+    user = update.effective_user
+    if user.id in _pending_url:
+        _pending_url.pop(user.id)
+        await update.message.reply_text("Cancelled.")
+    else:
+        await update.message.reply_text("Nothing to cancel.")
+
+
+async def handle_pending_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle plain text messages — used to receive URLs when in attachment waiting state."""
+    user = update.effective_user
+    if user.id not in _pending_url:
+        # Not in attachment state — fall through to handle_unknown
+        await handle_unknown(update, context)
+        return
+
+    page_id, expires_at = _pending_url[user.id]
+    if time.monotonic() > expires_at:
+        _pending_url.pop(user.id, None)
+        await update.message.reply_text(
+            "⏳ Your attachment window expired. Send a voice note and try again."
+        )
+        return
+
+    url_text = update.message.text.strip()
+    _pending_url.pop(user.id)  # consume immediately — prevent double-submit
+
+    config_row = await get_user_config(user.id)
+    if config_row is None:
+        await update.message.reply_text(
+            "You need to connect your Notion workspace first.\nUse /connect to get started."
+        )
+        return
+    token, _ = config_row
+
+    try:
+        await append_url_block(token, page_id, url_text)
+        await update.message.reply_text("✅ URL added to your note!")
+    except NotionUnauthorizedError:
+        await update.message.reply_text(
+            "⚠️ Notion connection expired. Use /connect to reconnect."
+        )
+    except NotionError as e:
+        logger.error("append_url_block failed for user %s: %s", user.id, e)
+        await update.message.reply_text(
+            "⚠️ Couldn't add the URL. Please try again."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -764,8 +852,10 @@ async def _run() -> None:
     ptb_app.add_handler(CommandHandler("connect", connect))
     ptb_app.add_handler(CommandHandler("settings", settings))
     ptb_app.add_handler(CommandHandler("disconnect", disconnect))
+    ptb_app.add_handler(CommandHandler("cancel", handle_cancel))
     ptb_app.add_handler(CallbackQueryHandler(handle_callback))
     ptb_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pending_url))
     ptb_app.add_handler(MessageHandler(filters.ALL, handle_unknown))
     ptb_app.add_error_handler(handle_error)
 

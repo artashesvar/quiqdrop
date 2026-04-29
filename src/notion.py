@@ -316,6 +316,25 @@ async def create_page(
     return page_id, page_url
 
 
+async def append_url_block(token: str, page_id: str, url: str) -> None:
+    """
+    Append a paragraph block containing url to an existing page.
+    Raises NotionUnauthorizedError if token is revoked.
+    Raises NotionError on all other API failures.
+    """
+    try:
+        await _notion.blocks.children.append(
+            block_id=page_id,
+            children=[_paragraph(url)],
+            auth=token,
+        )
+    except APIResponseError as e:
+        if e.code == APIErrorCode.Unauthorized:
+            raise NotionUnauthorizedError("Token invalid or revoked") from e
+        raise NotionError(f"append_url_block failed: {e.code} — {e}") from e
+    logger.info("Appended URL block to page %s", page_id)
+
+
 async def test_token(token: str) -> bool:
     """Return True if the token is valid, False if unauthorized."""
     try:
