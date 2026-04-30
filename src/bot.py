@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import secrets
 import sys
 import time
@@ -12,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -20,10 +22,12 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.helpers import escape_markdown
 
 import src.config as config
 from src.reminder_scheduler import reminder_scheduler_loop
 from src.db import (
+    close_db,
     delete_user_config,
     evict_stale_oauth_states,
     get_reminder_preferences,
@@ -43,6 +47,7 @@ from src.notion import (
     NotionPageNotFoundError,
     NotionUnauthorizedError,
     append_url_block,
+    close_aiohttp_session,
     create_page,
     exchange_token,
     search_pages,
@@ -50,6 +55,16 @@ from src.notion import (
 from src.structure import StructuringError, structure_transcript
 from src.text_cleaner import clean_transcript
 from src.transcribe import transcribe_audio
+
+
+def _md(text: str) -> str:
+    """Escape user-controlled text for Telegram Markdown (V1) — prevents broken parsing
+    when titles or names contain *, _, [, or backticks."""
+    return escape_markdown(text or "", version=1)
+
+
+# Accept http(s) URLs; reject anything else when receiving a URL to attach.
+_URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
 _MAX_VOICE_DURATION_SEC = 180    # 3 minutes — notes beyond this are trimmed to first 3 min
 _MAX_VOICE_SIZE_BYTES = 20 * 1024 * 1024  # 20MB — Whisper hard limit is 25MB
@@ -99,9 +114,27 @@ _TIMEZONE_OPTIONS: list[tuple[str, str]] = [
 # Page selection cache — maps short integer IDs to Notion page info per user.
 # Populated on each page fetch; resets on next fetch or bot restart.
 # Short IDs keep callback_data well within Telegram's 64-byte limit.
-# Grows by ~1 entry per user per page-fetch session — negligible at MVP scale.
-# If user count grows significantly, add eviction (e.g. keep only last N users).
+# Capped at _PAGE_CACHE_MAX_USERS — oldest user evicted (FIFO) when exceeded.
+_PAGE_CACHE_MAX_USERS = 1000
 _page_cache: dict[int, dict[int, dict]] = {}       # user_id → {short_id → {id, title}}
+
+# Background sweep interval — clears expired _pending_url entries.
+_STATE_SWEEP_INTERVAL_SEC = 600  # 10 minutes
+
+
+async def _state_sweeper_loop() -> None:
+    """Periodically drop expired _pending_url entries so memory stays bounded."""
+    while True:
+        await asyncio.sleep(_STATE_SWEEP_INTERVAL_SEC)
+        try:
+            now = time.monotonic()
+            expired = [uid for uid, (_pid, exp) in _pending_url.items() if now > exp]
+            for uid in expired:
+                _pending_url.pop(uid, None)
+            if expired:
+                logger.debug("state sweeper: evicted %d expired _pending_url entries", len(expired))
+        except Exception as exc:
+            logger.error("state sweeper failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +159,10 @@ def _build_parent_keyboard(user_id: int, pages: list[dict]) -> InlineKeyboardMar
     Assigns short integer IDs and caches them to stay within Telegram's 64-byte
     callback_data limit. Format: page_parent:{short_id} (~14 bytes).
     """
+    # Cap _page_cache size — drop oldest entries (FIFO) when exceeded.
+    while len(_page_cache) >= _PAGE_CACHE_MAX_USERS:
+        oldest = next(iter(_page_cache))
+        _page_cache.pop(oldest, None)
     _page_cache[user_id] = {}
     buttons = []
     i = 0
@@ -216,9 +253,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config_row = await get_user_config(user.id)
     if config_row is not None:
         _, page_id, page_title = config_row
-        page_status = f"*{page_title}*" if page_title else ("selected ✅" if page_id else "not selected yet — use /settings")
+        page_status = f"*{_md(page_title)}*" if page_title else ("selected ✅" if page_id else "not selected yet — use /settings")
         await update.message.reply_text(
-            f"Welcome back, {user.first_name}! 👋\n\n"
+            f"Welcome back, {_md(user.first_name)}! 👋\n\n"
             f"Your Notion workspace is connected.\n"
             f"Destination page: {page_status}\n\n"
             "Send me a voice note anytime 🎤",
@@ -226,7 +263,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         await update.message.reply_text(
-            f"Hey {user.first_name}! 👋\n\n"
+            f"Hey {_md(user.first_name)}! 👋\n\n"
             "I'm *QuiqDrop* — your voice-to-Notion assistant.\n\n"
             "To get started, connect your Notion workspace:\n"
             "👉 /connect",
@@ -269,13 +306,13 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     _, page_id, page_title = config_row
     workspace = await get_workspace_name(user.id) or "Notion"
-    page_display = f"*{page_title}*" if page_title else ("Selected ✅" if page_id else "_not selected yet_")
+    page_display = f"*{_md(page_title)}*" if page_title else ("Selected ✅" if page_id else "_not selected yet_")
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Disconnect", callback_data="disconnect_confirm_prompt")],
         [InlineKeyboardButton("⏰ Reminders", callback_data="settings_reminders")],
     ])
     await update.message.reply_text(
-        f"*Your Notion settings*\n\nWorkspace: {workspace}\nDestination page: {page_display}",
+        f"*Your Notion settings*\n\nWorkspace: {_md(workspace)}\nDestination page: {page_display}",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
@@ -348,7 +385,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await save_parent_page(user.id, page_id, page_title)
         logger.info("User %s selected page %s (%s)", user.id, page_id, page_title)
         await query.edit_message_text(
-            f"✅ All set! Your notes will be saved to 👉 *{page_title}*\n\n"
+            f"✅ All set! Your notes will be saved to 👉 *{_md(page_title)}*\n\n"
             "Send me a voice note anytime 🎤",
             parse_mode="Markdown",
         )
@@ -411,13 +448,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         _, page_id, page_title = config_row
         workspace = await get_workspace_name(user.id) or "Notion"
-        page_display = f"*{page_title}*" if page_title else ("Selected ✅" if page_id else "_not selected yet_")
+        page_display = f"*{_md(page_title)}*" if page_title else ("Selected ✅" if page_id else "_not selected yet_")
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("Disconnect", callback_data="disconnect_confirm_prompt")],
             [InlineKeyboardButton("⏰ Reminders", callback_data="settings_reminders")],
         ])
         await query.edit_message_text(
-            f"*Your Notion settings*\n\nWorkspace: {workspace}\nDestination page: {page_display}",
+            f"*Your Notion settings*\n\nWorkspace: {_md(workspace)}\nDestination page: {page_display}",
             parse_mode="Markdown",
             reply_markup=keyboard,
         )
@@ -465,6 +502,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("That voice clip was a little too short! ⚠️")
         return
 
+    # NOTE: this check-then-add is safe only because there is no `await` between
+    # the membership test and the .add() call below (single event-loop coroutine
+    # cannot preempt mid-block). Do not introduce an await between them, or two
+    # rapid voice notes from the same user could both pass the check.
     if user.id in _processing_users:
         await update.message.reply_text(
             "⏳ Your previous recording is still processing, please wait."
@@ -528,8 +569,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     "Wait, you're dropping gems! 💎 Need a few more seconds. "
                     "Don't want to miss a single one."
                 )
-            except Exception:
-                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("gem_nudge edit failed for user %s: %s", user.id, exc)
 
         gem_task = asyncio.create_task(_gem_nudge(progress_msg))
         try:
@@ -561,14 +604,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # Save to Notion
         await update.message.reply_text("Sending this straight to your Notion... 🧠")
+        title_md = _md(structured["title"])
+        summary_md = _md(structured["summary"])
         try:
             page_id, page_url = await create_page(token, parent_page_id, structured, transcript)
             _last_note_page[user.id] = page_id
             saved_line = "✅ Saved to Notion - only the first 3 min!" if is_trimmed else "✅ Saved to Notion!"
             await update.message.reply_text(
                 f"{saved_line}\n\n"
-                f"📄 {structured['title']}\n\n"
-                f"{structured['summary']}\n\n"
+                f"📄 {title_md}\n\n"
+                f"{summary_md}\n\n"
                 f"[{_truncate_url(page_url)}]({page_url})",
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
@@ -579,30 +624,58 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except NotionUnauthorizedError:
             logger.warning("Notion token expired for user %s", user.id)
             await update.message.reply_text(
-                f"📄 {structured['title']}\n\n"
-                f"{structured['summary']}\n\n"
-                "⚠️ Notion connection expired. Use /connect to reconnect."
+                f"📄 {title_md}\n\n"
+                f"{summary_md}\n\n"
+                "⚠️ Notion connection expired. Use /connect to reconnect.",
+                parse_mode="Markdown",
             )
         except NotionPageNotFoundError:
             logger.warning("Parent page deleted for user %s — clearing stored page", user.id)
             await save_parent_page(user.id, None)
             await update.message.reply_text(
-                f"📄 {structured['title']}\n\n"
-                f"{structured['summary']}\n\n"
+                f"📄 {title_md}\n\n"
+                f"{summary_md}\n\n"
                 "⚠️ The destination page no longer exists in Notion. "
-                "Use /settings to pick a new one."
+                "Use /settings to pick a new one.",
+                parse_mode="Markdown",
             )
         except NotionError as e:
             logger.error("Notion save failed for user %s: %s", user.id, e)
             await update.message.reply_text(
-                f"📄 {structured['title']}\n\n"
-                f"{structured['summary']}\n\n"
-                "⚠️ Transcribed but couldn't save to Notion. Please try again."
+                f"📄 {title_md}\n\n"
+                f"{summary_md}\n\n"
+                "⚠️ Transcribed but couldn't save to Notion. Please try again.",
+                parse_mode="Markdown",
             )
 
+    except asyncio.TimeoutError:
+        logger.error("Voice processing timed out for user %s", user.id)
+        with contextlib.suppress(Exception):
+            await update.message.reply_text(
+                "⏳ This took longer than expected. Please try again — a shorter note usually helps."
+            )
+    except (TimedOut, NetworkError) as e:
+        logger.error("Telegram network error for user %s: %s", user.id, e)
+        with contextlib.suppress(Exception):
+            await update.message.reply_text(
+                "📡 Network hiccup talking to Telegram. Please try sending the voice note again."
+            )
+    except BadRequest as e:
+        logger.error("Telegram bad request for user %s: %s", user.id, e)
+        with contextlib.suppress(Exception):
+            await update.message.reply_text(
+                "⚠️ Telegram couldn't process that message. Please try again."
+            )
+    except OSError as e:
+        logger.error("File I/O error for user %s: %s", user.id, e)
+        with contextlib.suppress(Exception):
+            await update.message.reply_text(
+                "⚠️ Couldn't read or save the audio on our side. Please try again."
+            )
     except Exception as e:
-        logger.error("handle_voice failed for user %s: %s", user.id, e)
-        await update.message.reply_text("Something went wrong. Please try again.")
+        logger.error("handle_voice failed for user %s: %s", user.id, e, exc_info=True)
+        with contextlib.suppress(Exception):
+            await update.message.reply_text("Something went wrong. Please try again.")
     finally:
         _processing_users.discard(user.id)
         if os.path.exists(file_path):
@@ -644,6 +717,14 @@ async def handle_pending_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     url_text = update.message.text.strip()
+
+    # Reject anything that doesn't look like a URL — the user can try again or /cancel
+    if not _URL_RE.match(url_text) or len(url_text) > 2000:
+        await update.message.reply_text(
+            "That doesn't look like a URL. Send a link starting with http:// or https://, or /cancel to stop."
+        )
+        return
+
     _pending_url.pop(user.id)  # consume immediately — prevent double-submit
 
     config_row = await get_user_config(user.id)
@@ -708,6 +789,31 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
     """Core OAuth callback logic — called by _oauth_callback which wraps it in a catch-all."""
     code = request.rel_url.query.get("code")
     state = request.rel_url.query.get("state")
+    error = request.rel_url.query.get("error")
+
+    # User clicked "Cancel" or denied access in Notion — Notion sends error=access_denied
+    # plus the original state so we can identify the user and notify them in Telegram.
+    if error:
+        logger.info("OAuth callback received error=%s state=%s", error, state)
+        if state:
+            user_id_cancel, _ = await pop_oauth_state(state)
+            if user_id_cancel is not None:
+                with contextlib.suppress(Exception):
+                    await ptb_app.bot.send_message(
+                        chat_id=user_id_cancel,
+                        text=(
+                            "Notion connection was cancelled. "
+                            "When you're ready, use /connect to try again."
+                        ),
+                    )
+        return web.Response(
+            text=(
+                "<html><body><h1>Connection cancelled.</h1>"
+                "<p>You can return to Telegram and try /connect again whenever you're ready.</p></body></html>"
+            ),
+            content_type="text/html",
+            status=200,
+        )
 
     if not code or not state:
         return web.Response(
@@ -716,13 +822,32 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
             status=400,
         )
 
-    user_id = await pop_oauth_state(state)
+    user_id, was_expired = await pop_oauth_state(state)
     if user_id is None:
         logger.warning("OAuth callback received unknown state: %s", state)
         return web.Response(
             text=(
-                "<html><body><h1>Unknown or expired session.</h1>"
+                "<html><body><h1>Unknown session.</h1>"
                 "<p>Please return to Telegram and use /connect again.</p></body></html>"
+            ),
+            content_type="text/html",
+            status=400,
+        )
+
+    if was_expired:
+        logger.warning("OAuth state expired for user %s", user_id)
+        with contextlib.suppress(Exception):
+            await ptb_app.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "⏳ Your connection link expired. "
+                    "Use /connect to start fresh — it only takes a moment."
+                ),
+            )
+        return web.Response(
+            text=(
+                "<html><body><h1>This link expired.</h1>"
+                "<p>Return to Telegram and use /connect again to get a fresh link.</p></body></html>"
             ),
             content_type="text/html",
             status=400,
@@ -750,6 +875,7 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
         logger.error("search_pages failed after OAuth for user %s: %s", user_id, e)
         pages = []
 
+    workspace_md = _md(workspace_name)
     if pages:
         keyboard = _build_parent_keyboard(user_id, pages)
         top_level = keyboard.inline_keyboard
@@ -762,8 +888,8 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
                 await ptb_app.bot.send_message(
                     chat_id=user_id,
                     text=(
-                        f"Connected to *{workspace_name}* 🎉\n\n"
-                        f"Your notes will be saved to 👉 *{cached['title']}*\n\n"
+                        f"Connected to *{workspace_md}* 🎉\n\n"
+                        f"Your notes will be saved to 👉 *{_md(cached['title'])}*\n\n"
                         "Send me a voice note anytime 🎤"
                     ),
                     parse_mode="Markdown",
@@ -772,28 +898,28 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
                 # Cache miss — fall back to picker
                 await ptb_app.bot.send_message(
                     chat_id=user_id,
-                    text=f"Connected to *{workspace_name}* 🎉\n\nNow choose where to save your notes:",
+                    text=f"Connected to *{workspace_md}* 🎉\n\nNow choose where to save your notes:",
                     parse_mode="Markdown",
                     reply_markup=keyboard,
                 )
         elif top_level:
             await ptb_app.bot.send_message(
                 chat_id=user_id,
-                text=f"Connected to *{workspace_name}* 🎉\n\nYou shared more than 1 page. Pick the one as your final destination.",
+                text=f"Connected to *{workspace_md}* 🎉\n\nYou shared more than 1 page. Pick the one as your final destination.",
                 parse_mode="Markdown",
                 reply_markup=keyboard,
             )
         else:
             await ptb_app.bot.send_message(
                 chat_id=user_id,
-                text=f"Connected to *{workspace_name}* 🎉\n\n{_NO_TOP_LEVEL_MSG}",
+                text=f"Connected to *{workspace_md}* 🎉\n\n{_NO_TOP_LEVEL_MSG}",
                 parse_mode="Markdown",
             )
     else:
         await ptb_app.bot.send_message(
             chat_id=user_id,
             text=(
-                f"Connected to *{workspace_name}* 🎉\n\n"
+                f"Connected to *{workspace_md}* 🎉\n\n"
                 "No pages found yet. Share a page with the QuiqDrop integration in Notion, "
                 "then use /settings to select it."
             ),
@@ -860,19 +986,25 @@ async def _run() -> None:
         await ptb_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         logger.info("Bot polling started.")
         scheduler_task = asyncio.create_task(reminder_scheduler_loop(ptb_app.bot))
+        sweeper_task = asyncio.create_task(_state_sweeper_loop())
         try:
             await asyncio.Event().wait()  # run until Ctrl+C / SIGTERM
         except (KeyboardInterrupt, SystemExit):
             pass
         finally:
             scheduler_task.cancel()
+            sweeper_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await scheduler_task
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweeper_task
             # Must stop before async with __aexit__ calls shutdown() — otherwise RuntimeError
             await ptb_app.updater.stop()
             await ptb_app.stop()
 
     await runner.cleanup()
+    await close_aiohttp_session()
+    await close_db()
     logger.info("Shutdown complete.")
 
 

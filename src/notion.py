@@ -1,4 +1,5 @@
 # Notion API integration — OAuth token exchange, page search, page creation
+from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
@@ -16,6 +17,25 @@ _notion = AsyncClient()
 
 # Notion API enforces a 2000-char limit per rich_text content block
 _RICH_TEXT_LIMIT = 2000
+
+# Shared aiohttp session for OAuth token exchange — avoids reopening a connection
+# pool per /oauth/notion/callback. Created lazily so it lives in the right event loop.
+_aiohttp_session: aiohttp.ClientSession | None = None
+
+
+async def _get_aiohttp_session() -> aiohttp.ClientSession:
+    global _aiohttp_session
+    if _aiohttp_session is None or _aiohttp_session.closed:
+        _aiohttp_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+    return _aiohttp_session
+
+
+async def close_aiohttp_session() -> None:
+    """Close the shared session. Call on shutdown."""
+    global _aiohttp_session
+    if _aiohttp_session is not None and not _aiohttp_session.closed:
+        await _aiohttp_session.close()
+        _aiohttp_session = None
 
 
 class NotionError(Exception):
@@ -94,14 +114,13 @@ async def exchange_token(code: str) -> tuple[str, str]:
     }
     auth = aiohttp.BasicAuth(login=config.NOTION_CLIENT_ID, password=config.NOTION_CLIENT_SECRET)
 
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, json=payload, auth=auth) as resp:
-            body = await resp.json()
-            if resp.status != 200:
-                # Do NOT log the code — it's single-use and sensitive
-                logger.error("Notion token exchange failed: status=%d body=%s", resp.status, body)
-                raise NotionOAuthError(f"Token exchange failed ({resp.status}): {body.get('error')}")
+    session = await _get_aiohttp_session()
+    async with session.post(url, json=payload, auth=auth) as resp:
+        body = await resp.json()
+        if resp.status != 200:
+            # Do NOT log the code — it's single-use and sensitive
+            logger.error("Notion token exchange failed: status=%d body=%s", resp.status, body)
+            raise NotionOAuthError(f"Token exchange failed ({resp.status}): {body.get('error')}")
 
     access_token: str = body["access_token"]
     workspace_name: str = body.get("workspace_name", "Notion")
