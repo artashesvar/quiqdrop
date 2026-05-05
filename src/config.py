@@ -31,7 +31,10 @@ NOTION_REDIRECT_URI: str = os.environ["NOTION_REDIRECT_URI"]
 # Base URL of our public web server (Coolify) — derived from the OAuth redirect URI.
 # Used to host the /r/{path} deep-link bouncer that opens notion:// on mobile.
 _parsed_redirect = urlparse(NOTION_REDIRECT_URI)
-BASE_URL: str = f"{_parsed_redirect.scheme}://{_parsed_redirect.netloc}"
+_derived_base = f"{_parsed_redirect.scheme}://{_parsed_redirect.netloc}"
+# PUBLIC_BASE_URL overrides the derived value — set this if NOTION_REDIRECT_URI points
+# to a raw IP but you want a real domain in user-visible bouncer links.
+BASE_URL: str = os.getenv("PUBLIC_BASE_URL", _derived_base).rstrip("/")
 PORT: int = int(os.getenv("PORT", "8080"))
 DB_PATH: str = os.getenv("DB_PATH", "/data/quiqdrop.db")
 ENABLE_TRANSCRIPT_CLEANING: bool = os.getenv("ENABLE_TRANSCRIPT_CLEANING", "true").lower() == "true"  # defaults to true — set false in .env to inspect raw Whisper output

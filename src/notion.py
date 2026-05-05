@@ -38,6 +38,21 @@ async def close_aiohttp_session() -> None:
         _aiohttp_session = None
 
 
+_NOTION_WEB_PREFIX = "https://www.notion.so/"
+
+
+def app_redirect_url(notion_url: str) -> str:
+    """
+    Wrap a notion.so page URL in our /r/{path} bouncer so tapping it on mobile
+    opens the Notion app (notion:// scheme) instead of forcing a browser login.
+    Falls back to the original https URL if the prefix doesn't match (safety net).
+    """
+    if not notion_url.startswith(_NOTION_WEB_PREFIX):
+        return notion_url
+    path = notion_url[len(_NOTION_WEB_PREFIX):]
+    return f"{config.BASE_URL}/r/{path}"
+
+
 class NotionError(Exception):
     """Base for all Notion-related errors."""
 

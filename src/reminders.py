@@ -12,7 +12,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from src.db import ReminderUser
-from src.notion import fetch_child_pages_in_range
+from src.notion import app_redirect_url, fetch_child_pages_in_range
 from src.reminder_scheduler import calculate_local_time
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ def format_daily_reminder_message(date_str: str, notes: list[dict]) -> str:
     lines = [f"{header}\n\nYou captured {count} {noun} yesterday:\n"]
     for note in notes:
         lines.append(f"📄 {note['title']}")
-        lines.append(note["url"])
+        lines.append(app_redirect_url(note["url"]))
     return "\n".join(lines)
 
 
@@ -142,7 +142,7 @@ def format_weekly_reminder_message(range_str: str, notes: list[dict]) -> str:
     lines = [f"{header}\n\nYou captured {count} {noun} last week! 🎉\n"]
     for note in notes:
         lines.append(f"📄 {note['title']}")
-        lines.append(note["url"])
+        lines.append(app_redirect_url(note["url"]))
     lines.append("\nKeep capturing! 💡")
     return "\n".join(lines)
 

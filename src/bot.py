@@ -48,6 +48,7 @@ from src.notion import (
     NotionOAuthError,
     NotionPageNotFoundError,
     NotionUnauthorizedError,
+    app_redirect_url,
     append_url_block,
     close_aiohttp_session,
     create_page,
@@ -203,21 +204,22 @@ def _truncate_url(url: str, max_len: int = 45) -> str:
     return url[:max_len] + "..." if len(url) > max_len else url
 
 
+# Notion page IDs are always 32 consecutive hex chars in the URL.
+# Reject any bouncer path that doesn't contain one — prevents using our server
+# as an open redirector to arbitrary notion.so paths.
+_NOTION_PAGE_ID_RE = re.compile(r"[0-9a-f]{32}", re.IGNORECASE)
+
 _NOTION_WEB_PREFIX = "https://www.notion.so/"
 
 
-def _app_redirect_url(notion_url: str) -> str:
+def _js_str(value: str) -> str:
+    """JSON-encode a string for safe embedding inside a <script> tag.
+
+    json.dumps does NOT escape the sequence </script>, which HTML parsers treat
+    as the end of the script tag even inside a string literal. This is the
+    standard mitigation: replace </ with <\\/ so the parser never sees </script>.
     """
-    Wrap a notion.so URL in our /r/{path} bouncer so that, on mobile,
-    the link opens the Notion app (via the notion:// scheme) instead of
-    a Telegram in-app webview that forces a Notion login.
-    On desktop / when the Notion app isn't installed, the bouncer falls
-    back to the original https URL after a short delay.
-    """
-    if not notion_url.startswith(_NOTION_WEB_PREFIX):
-        return notion_url
-    path = notion_url[len(_NOTION_WEB_PREFIX):]
-    return f"{config.BASE_URL}/r/{path}"
+    return json.dumps(value).replace("</", r"<\/")
 
 
 _APP_REDIRECT_HTML = """<!DOCTYPE html>
@@ -234,11 +236,16 @@ _APP_REDIRECT_HTML = """<!DOCTYPE html>
 <p>Opening your note in the Notion app…</p>
 <p><a href="{web_href}">Tap here if it didn't open</a></p>
 <script>
-  // Try the app first; fall back to the web URL if the scheme isn't handled.
   var appUrl = {app_json};
   var webUrl = {web_json};
+  // Cancel the web fallback if the OS handled the notion:// scheme —
+  // the page becomes hidden/unloaded when the Notion app takes over.
+  var timer = setTimeout(function() {{ window.location.replace(webUrl); }}, 1500);
+  document.addEventListener('visibilitychange', function() {{
+    if (document.hidden) {{ clearTimeout(timer); }}
+  }});
+  window.addEventListener('pagehide', function() {{ clearTimeout(timer); }});
   window.location.replace(appUrl);
-  setTimeout(function() {{ window.location.replace(webUrl); }}, 1500);
 </script>
 </body></html>"""
 
@@ -248,12 +255,19 @@ async def _app_redirect_handler(request: web.Request) -> web.Response:
     path = request.match_info.get("path", "")
     query = request.rel_url.query_string
     suffix = f"?{query}" if query else ""
+
+    # Reject paths that don't look like a real Notion page (no 32-char hex page ID).
+    if not _NOTION_PAGE_ID_RE.search(path):
+        logger.warning("Bouncer: rejected invalid path (no Notion page ID): %.200s", path)
+        return web.Response(text="Invalid Notion link.", status=400)
+
     notion_web = f"{_NOTION_WEB_PREFIX}{path}{suffix}"
     notion_app = f"notion://www.notion.so/{path}{suffix}"
+    logger.debug("Bouncer: serving redirect for path=%.80s", path)
     body = _APP_REDIRECT_HTML.format(
         web_href=html_lib.escape(notion_web, quote=True),
-        web_json=json.dumps(notion_web),
-        app_json=json.dumps(notion_app),
+        web_json=_js_str(notion_web),
+        app_json=_js_str(notion_app),
     )
     return web.Response(text=body, content_type="text/html")
 
@@ -667,12 +681,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             page_id, page_url = await create_page(token, parent_page_id, structured, transcript)
             _last_note_page[user.id] = page_id
             saved_line = "✅ Saved to Notion - only the first 3 min!" if is_trimmed else "✅ Saved to Notion!"
-            link_href = _app_redirect_url(page_url)
+            link_href = app_redirect_url(page_url)
             await update.message.reply_text(
                 f"{saved_line}\n\n"
                 f"📄 {title_md}\n\n"
                 f"{summary_md}\n\n"
-                f"[{_truncate_url(page_url)}]({link_href})",
+                f"[Open in Notion ↗]({link_href})",
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup([
