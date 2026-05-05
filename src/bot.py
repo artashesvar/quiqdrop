@@ -1,6 +1,8 @@
 # Telegram listener and main entry point
 import asyncio
 import contextlib
+import html as html_lib
+import json
 import logging
 import os
 import re
@@ -199,6 +201,61 @@ def _build_timezone_keyboard(pending_toggle: str) -> InlineKeyboardMarkup:
 def _truncate_url(url: str, max_len: int = 45) -> str:
     """Truncate a URL to max_len chars, appending '...' if cut."""
     return url[:max_len] + "..." if len(url) > max_len else url
+
+
+_NOTION_WEB_PREFIX = "https://www.notion.so/"
+
+
+def _app_redirect_url(notion_url: str) -> str:
+    """
+    Wrap a notion.so URL in our /r/{path} bouncer so that, on mobile,
+    the link opens the Notion app (via the notion:// scheme) instead of
+    a Telegram in-app webview that forces a Notion login.
+    On desktop / when the Notion app isn't installed, the bouncer falls
+    back to the original https URL after a short delay.
+    """
+    if not notion_url.startswith(_NOTION_WEB_PREFIX):
+        return notion_url
+    path = notion_url[len(_NOTION_WEB_PREFIX):]
+    return f"{config.BASE_URL}/r/{path}"
+
+
+_APP_REDIRECT_HTML = """<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Opening in Notion…</title>
+<style>
+  body {{ font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif;
+         padding: 2rem; color: #333; text-align: center; }}
+  a {{ color: #2383e2; }}
+</style>
+</head><body>
+<p>Opening your note in the Notion app…</p>
+<p><a href="{web_href}">Tap here if it didn't open</a></p>
+<script>
+  // Try the app first; fall back to the web URL if the scheme isn't handled.
+  var appUrl = {app_json};
+  var webUrl = {web_json};
+  window.location.replace(appUrl);
+  setTimeout(function() {{ window.location.replace(webUrl); }}, 1500);
+</script>
+</body></html>"""
+
+
+async def _app_redirect_handler(request: web.Request) -> web.Response:
+    """Serve the deep-link bouncer page for /r/{path}."""
+    path = request.match_info.get("path", "")
+    query = request.rel_url.query_string
+    suffix = f"?{query}" if query else ""
+    notion_web = f"{_NOTION_WEB_PREFIX}{path}{suffix}"
+    notion_app = f"notion://www.notion.so/{path}{suffix}"
+    body = _APP_REDIRECT_HTML.format(
+        web_href=html_lib.escape(notion_web, quote=True),
+        web_json=json.dumps(notion_web),
+        app_json=json.dumps(notion_app),
+    )
+    return web.Response(text=body, content_type="text/html")
 
 
 def _format_structured(data: dict) -> str:
@@ -610,11 +667,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             page_id, page_url = await create_page(token, parent_page_id, structured, transcript)
             _last_note_page[user.id] = page_id
             saved_line = "✅ Saved to Notion - only the first 3 min!" if is_trimmed else "✅ Saved to Notion!"
+            link_href = _app_redirect_url(page_url)
             await update.message.reply_text(
                 f"{saved_line}\n\n"
                 f"📄 {title_md}\n\n"
                 f"{summary_md}\n\n"
-                f"[{_truncate_url(page_url)}]({page_url})",
+                f"[{_truncate_url(page_url)}]({link_href})",
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup([
@@ -949,6 +1007,8 @@ def _create_web_app(ptb_app: Application) -> web.Application:
 
     app.router.add_get("/oauth/notion/callback", callback_handler)
     app.router.add_get("/health", health_handler)
+    # Deep-link bouncer — opens notion:// on mobile, falls back to https on desktop.
+    app.router.add_get("/r/{path:.*}", _app_redirect_handler)
     return app
 
 

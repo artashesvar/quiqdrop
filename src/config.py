@@ -1,6 +1,7 @@
 # Environment variable loader
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 # Always load .env from the project root, regardless of where the script is run from
@@ -26,6 +27,11 @@ ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 NOTION_CLIENT_ID: str = os.environ["NOTION_CLIENT_ID"]
 NOTION_CLIENT_SECRET: str = os.environ["NOTION_CLIENT_SECRET"]
 NOTION_REDIRECT_URI: str = os.environ["NOTION_REDIRECT_URI"]
+
+# Base URL of our public web server (Coolify) — derived from the OAuth redirect URI.
+# Used to host the /r/{path} deep-link bouncer that opens notion:// on mobile.
+_parsed_redirect = urlparse(NOTION_REDIRECT_URI)
+BASE_URL: str = f"{_parsed_redirect.scheme}://{_parsed_redirect.netloc}"
 PORT: int = int(os.getenv("PORT", "8080"))
 DB_PATH: str = os.getenv("DB_PATH", "/data/quiqdrop.db")
 ENABLE_TRANSCRIPT_CLEANING: bool = os.getenv("ENABLE_TRANSCRIPT_CLEANING", "true").lower() == "true"  # defaults to true — set false in .env to inspect raw Whisper output
