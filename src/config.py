@@ -54,3 +54,9 @@ ENABLE_AI_STRUCTURING: bool = os.getenv("ENABLE_AI_STRUCTURING", "true").lower()
 if ENABLE_AI_STRUCTURING and not ANTHROPIC_API_KEY:
     raise RuntimeError("Missing required environment variable: ANTHROPIC_API_KEY (required when ENABLE_AI_STRUCTURING=true)")
 WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "whisper-1")  # whisper-1 is currently the only Whisper model OpenAI exposes via API
+
+# Optional — base64-encoded 32-byte Fernet key used to encrypt Notion access tokens
+# at rest in the SQLite DB. Generate with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# If unset, tokens are stored in plaintext (backwards-compat for existing deploys).
+NOTION_TOKEN_KEY: str = os.getenv("NOTION_TOKEN_KEY", "")

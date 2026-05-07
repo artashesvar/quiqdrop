@@ -7,9 +7,61 @@ import time
 import typing
 import aiosqlite
 
+from cryptography.fernet import Fernet, InvalidToken
+
 import src.config as config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Token encryption at rest (Fernet / AES-128-CBC + HMAC-SHA256).
+# Stored tokens are prefixed with "enc:v1:" so we can detect plaintext (legacy
+# rows from before this change) and encrypt them lazily on read or migration.
+# ---------------------------------------------------------------------------
+
+_ENC_PREFIX = "enc:v1:"
+_fernet: Fernet | None = None
+
+
+def _get_fernet() -> Fernet | None:
+    """Return the Fernet cipher if NOTION_TOKEN_KEY is configured, else None."""
+    global _fernet
+    if _fernet is not None:
+        return _fernet
+    if not config.NOTION_TOKEN_KEY:
+        return None
+    try:
+        _fernet = Fernet(config.NOTION_TOKEN_KEY.encode("utf-8"))
+    except Exception as e:
+        logger.error("Invalid NOTION_TOKEN_KEY — must be a base64-encoded 32-byte Fernet key: %s", e)
+        raise
+    return _fernet
+
+
+def _encrypt_token(plain: str) -> str:
+    """Encrypt a token for storage. Returns plaintext unchanged if no key configured."""
+    f = _get_fernet()
+    if f is None:
+        return plain
+    return _ENC_PREFIX + f.encrypt(plain.encode("utf-8")).decode("ascii")
+
+
+def _decrypt_token(stored: str) -> str:
+    """Decrypt a stored token. Plaintext (legacy) values pass through unchanged."""
+    if not stored.startswith(_ENC_PREFIX):
+        return stored  # legacy plaintext row, or no key configured at write time
+    f = _get_fernet()
+    if f is None:
+        # Encrypted-on-disk but no key now — refuse rather than serve garbage
+        raise RuntimeError(
+            "Stored token is encrypted but NOTION_TOKEN_KEY is not set. "
+            "Restore the key or wipe /data/quiqdrop.db."
+        )
+    try:
+        return f.decrypt(stored[len(_ENC_PREFIX):].encode("ascii")).decode("utf-8")
+    except InvalidToken as e:
+        raise RuntimeError("Stored token failed Fernet auth — wrong NOTION_TOKEN_KEY?") from e
 
 
 class ReminderUser(typing.NamedTuple):
@@ -115,7 +167,32 @@ async def init_db() -> None:
         except aiosqlite.OperationalError:
             # Column already exists — safe to ignore.
             pass
+    # If a token key is now configured, encrypt any legacy plaintext rows in place.
+    # Idempotent — already-encrypted rows are skipped via the prefix check.
+    await _migrate_plaintext_tokens()
     logger.info("Database initialised at %s", _DB_PATH)
+
+
+async def _migrate_plaintext_tokens() -> None:
+    """One-shot encryption upgrade for rows written before NOTION_TOKEN_KEY existed."""
+    if _get_fernet() is None:
+        return  # No key configured — nothing to do, plaintext stays plaintext.
+    db = await _conn()
+    async with db.execute(
+        "SELECT telegram_user_id, notion_access_token FROM users WHERE notion_access_token NOT LIKE ?",
+        (f"{_ENC_PREFIX}%",),
+    ) as cursor:
+        legacy = await cursor.fetchall()
+    if not legacy:
+        return
+    for user_id, plain_token in legacy:
+        encrypted = _encrypt_token(plain_token)
+        await db.execute(
+            "UPDATE users SET notion_access_token = ? WHERE telegram_user_id = ?",
+            (encrypted, user_id),
+        )
+    await db.commit()
+    logger.info("Encrypted %d legacy plaintext token(s) at rest", len(legacy))
 
 
 _OAUTH_TTL_SEC = 3600  # 1 hour — plenty of time to complete the OAuth flow
@@ -194,10 +271,11 @@ async def evict_stale_oauth_states() -> None:
 
 async def save_user_token(user_id: int, token: str, workspace_name: str) -> None:
     """
-    Upsert token and workspace name for a user.
+    Upsert encrypted token and workspace name for a user.
     Resets parent_page_id and parent_page_title to NULL so the user picks a page
     fresh after each reconnect (and we never display a stale page name).
     """
+    stored_token = _encrypt_token(token)
     db = await _conn()
     await db.execute(
         """
@@ -210,7 +288,7 @@ async def save_user_token(user_id: int, token: str, workspace_name: str) -> None
             parent_page_title   = NULL,
             updated_at          = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
         """,
-        (user_id, token, workspace_name),
+        (user_id, stored_token, workspace_name),
     )
     await db.commit()
     logger.info("Saved token for user %s (workspace: %s)", user_id, workspace_name)
@@ -246,6 +324,7 @@ async def get_user_config(user_id: int) -> tuple[str, str | None, str | None] | 
     """
     Return (notion_access_token, parent_page_id, parent_page_title) for the user,
     or None if the user has not connected their workspace.
+    Token is decrypted on the way out — callers always see plaintext.
     parent_page_id / parent_page_title may be None if no page selected yet.
     """
     db = await _conn()
@@ -256,7 +335,7 @@ async def get_user_config(user_id: int) -> tuple[str, str | None, str | None] | 
         row = await cursor.fetchone()
     if row is None:
         return None
-    return row[0], row[1], row[2]
+    return _decrypt_token(row[0]), row[1], row[2]
 
 
 async def get_workspace_name(user_id: int) -> str | None:
@@ -392,7 +471,7 @@ async def get_users_with_reminders_enabled() -> list[ReminderUser]:
             time_zone=row[1],
             daily_reminder_enabled=bool(row[2]),
             weekly_reminder_enabled=bool(row[3]),
-            notion_access_token=row[4],
+            notion_access_token=_decrypt_token(row[4]),
             parent_page_id=row[5],
         )
         for row in rows

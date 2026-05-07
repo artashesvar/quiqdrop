@@ -21,3 +21,6 @@ pydub>=0.25.0
 
 # Async SQLite driver — used for per-user token and OAuth state storage
 aiosqlite>=0.19.0
+
+# Symmetric encryption (Fernet) — used to encrypt Notion access tokens at rest
+cryptography>=42.0.0
