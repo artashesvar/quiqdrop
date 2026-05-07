@@ -20,6 +20,17 @@ class ReminderUser(typing.NamedTuple):
     notion_access_token: str
     parent_page_id: str | None
 
+
+class OAuthStateResult(typing.NamedTuple):
+    """Outcome of pop_oauth_state. status is one of:
+    - "ok"       — fresh, valid, just marked consumed
+    - "consumed" — already used within the idempotency window (browser retry)
+    - "expired"  — past TTL (deleted)
+    - "unknown"  — never existed (or already swept)
+    """
+    user_id: int | None
+    status: str
+
 _DB_PATH = config.DB_PATH
 
 # Single long-lived connection — avoids open/close + fsync per query.
@@ -68,12 +79,15 @@ CREATE TABLE IF NOT EXISTS users (
 """
 
 # OAuth state tokens — persisted so bot restarts don't invalidate in-progress flows.
-# expires_at is a Unix timestamp (INTEGER). Rows are deleted on pop or eviction.
+# expires_at is a Unix timestamp (INTEGER). Rows are deleted by the sweeper.
+# consumed_at is set when the state is first popped; rows kept briefly to make
+# repeated callbacks (browser retry, double-click) idempotent.
 _CREATE_PENDING_OAUTH_TABLE = """
 CREATE TABLE IF NOT EXISTS pending_oauth (
-    state           TEXT    PRIMARY KEY,
+    state            TEXT    PRIMARY KEY,
     telegram_user_id INTEGER NOT NULL,
-    expires_at      INTEGER NOT NULL
+    expires_at       INTEGER NOT NULL,
+    consumed_at      INTEGER
 )
 """
 
@@ -84,6 +98,7 @@ _MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN weekly_reminder_enabled INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE users ADD COLUMN reminder_failed_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE users ADD COLUMN parent_page_title TEXT",
+    "ALTER TABLE pending_oauth ADD COLUMN consumed_at INTEGER",
 ]
 
 
@@ -104,49 +119,73 @@ async def init_db() -> None:
 
 
 _OAUTH_TTL_SEC = 3600  # 1 hour — plenty of time to complete the OAuth flow
+_OAUTH_CONSUMED_GRACE_SEC = 300  # keep consumed rows for 5 min so retries are idempotent
 
 
 async def save_oauth_state(state: str, user_id: int) -> None:
-    """Persist an OAuth state token mapped to a Telegram user ID."""
+    """Persist an OAuth state token mapped to a Telegram user ID.
+    Drops any prior pending states for the same user — only the latest /connect
+    URL works, others are invalidated."""
     expires_at = int(time.time()) + _OAUTH_TTL_SEC
     db = await _conn()
+    # M3: dedupe — one pending state per user.
     await db.execute(
-        "INSERT OR REPLACE INTO pending_oauth (state, telegram_user_id, expires_at) VALUES (?, ?, ?)",
+        "DELETE FROM pending_oauth WHERE telegram_user_id = ?",
+        (user_id,),
+    )
+    await db.execute(
+        "INSERT INTO pending_oauth (state, telegram_user_id, expires_at) VALUES (?, ?, ?)",
         (state, user_id, expires_at),
     )
     await db.commit()
 
 
-async def pop_oauth_state(state: str) -> tuple[int | None, bool]:
+async def pop_oauth_state(state: str) -> OAuthStateResult:
     """
-    Remove and return the Telegram user ID for the given state token.
+    Look up an OAuth state token. Mark it consumed on first hit so a retry
+    within the grace window returns "consumed" rather than "unknown".
 
-    Returns (user_id, was_expired):
-      - (uid, False): valid state, deleted, ready to use
-      - (uid, True):  state existed but was expired; deleted; do NOT exchange the code,
-                       but the caller can still notify the user
-      - (None, False): state never existed (or was already popped)
+    See OAuthStateResult.status for the four possible outcomes.
     """
     db = await _conn()
     async with db.execute(
-        "SELECT telegram_user_id, expires_at FROM pending_oauth WHERE state = ?",
+        "SELECT telegram_user_id, expires_at, consumed_at FROM pending_oauth WHERE state = ?",
         (state,),
     ) as cursor:
         row = await cursor.fetchone()
     if row is None:
-        return None, False
-    await db.execute("DELETE FROM pending_oauth WHERE state = ?", (state,))
+        return OAuthStateResult(None, "unknown")
+    user_id, expires_at, consumed_at = row
+    now = int(time.time())
+    if consumed_at is not None:
+        return OAuthStateResult(user_id, "consumed")
+    if now > expires_at:
+        # Expired states get deleted immediately — no idempotency value.
+        await db.execute("DELETE FROM pending_oauth WHERE state = ?", (state,))
+        await db.commit()
+        return OAuthStateResult(user_id, "expired")
+    # Mark consumed (don't delete yet) — sweeper will GC after the grace window.
+    await db.execute(
+        "UPDATE pending_oauth SET consumed_at = ? WHERE state = ?",
+        (now, state),
+    )
     await db.commit()
-    user_id, expires_at = row
-    return user_id, int(time.time()) > expires_at
+    return OAuthStateResult(user_id, "ok")
 
 
 async def evict_stale_oauth_states() -> None:
-    """Delete all expired OAuth state rows. Call periodically to keep the table clean."""
+    """Delete expired rows AND consumed rows past the idempotency grace window.
+    Call periodically to keep the table clean."""
+    now = int(time.time())
+    grace_cutoff = now - _OAUTH_CONSUMED_GRACE_SEC
     db = await _conn()
     cursor = await db.execute(
-        "DELETE FROM pending_oauth WHERE expires_at < ?",
-        (int(time.time()),),
+        """
+        DELETE FROM pending_oauth
+        WHERE expires_at < ?
+           OR (consumed_at IS NOT NULL AND consumed_at < ?)
+        """,
+        (now, grace_cutoff),
     )
     await db.commit()
     if cursor.rowcount:
@@ -177,8 +216,13 @@ async def save_user_token(user_id: int, token: str, workspace_name: str) -> None
     logger.info("Saved token for user %s (workspace: %s)", user_id, workspace_name)
 
 
-async def save_parent_page(user_id: int, page_id: str, page_title: str = "") -> None:
-    """Update the destination page for an existing user."""
+async def save_parent_page(
+    user_id: int,
+    page_id: str | None,
+    page_title: str | None = "",
+) -> None:
+    """Update (or clear) the destination page for an existing user.
+    Pass page_id=None to unset (e.g. when the parent page no longer exists)."""
     db = await _conn()
     cursor = await db.execute(
         """
@@ -187,11 +231,13 @@ async def save_parent_page(user_id: int, page_id: str, page_title: str = "") -> 
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
         WHERE telegram_user_id = ?
         """,
-        (page_id, page_title, user_id),
+        (page_id, page_title or "", user_id),
     )
     await db.commit()
     if cursor.rowcount == 0:
         logger.warning("save_parent_page: no row found for user %s — token was never saved", user_id)
+    elif page_id is None:
+        logger.info("Cleared parent page for user %s", user_id)
     else:
         logger.info("Saved parent page for user %s: %s", user_id, page_id)
 

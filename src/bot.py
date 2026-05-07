@@ -149,16 +149,18 @@ _STATE_SWEEP_INTERVAL_SEC = 600  # 10 minutes
 
 
 async def _state_sweeper_loop() -> None:
-    """Periodically drop expired _pending_url entries so memory stays bounded."""
+    """Periodically drop expired _pending_url entries and stale OAuth state rows."""
     while True:
         await asyncio.sleep(_STATE_SWEEP_INTERVAL_SEC)
         try:
             now = time.monotonic()
-            expired = [uid for uid, (_pid, exp) in _pending_url.items() if now > exp]
+            expired = [uid for uid, entry in _pending_url.items() if now > entry[-1]]
             for uid in expired:
                 _pending_url.pop(uid, None)
             if expired:
                 logger.debug("state sweeper: evicted %d expired _pending_url entries", len(expired))
+            # M2: also sweep stale rows in the pending_oauth DB table.
+            await evict_stale_oauth_states()
         except Exception as exc:
             logger.error("state sweeper failed: %s", exc)
 
@@ -942,11 +944,11 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
     if error:
         logger.info("OAuth callback received error=%s state=%s", error, state)
         if state:
-            user_id_cancel, _ = await pop_oauth_state(state)
-            if user_id_cancel is not None:
+            cancel_result = await pop_oauth_state(state)
+            if cancel_result.user_id is not None and cancel_result.status in ("ok", "expired"):
                 with contextlib.suppress(Exception):
                     await ptb_app.bot.send_message(
-                        chat_id=user_id_cancel,
+                        chat_id=cancel_result.user_id,
                         text=(
                             "Notion connection was cancelled. "
                             "When you're ready, use /connect to try again."
@@ -968,8 +970,9 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
             status=400,
         )
 
-    user_id, was_expired = await pop_oauth_state(state)
-    if user_id is None:
+    state_result = await pop_oauth_state(state)
+    user_id = state_result.user_id
+    if state_result.status == "unknown":
         logger.warning("OAuth callback received unknown state: %s", state)
         return web.Response(
             text=(
@@ -980,7 +983,22 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
             status=400,
         )
 
-    if was_expired:
+    if state_result.status == "consumed":
+        # Browser retried, double-clicked, or shared the URL across devices.
+        # The first hit already completed the connection. Show a friendly success page
+        # without re-running the token exchange.
+        logger.info("OAuth callback retry on consumed state for user %s — idempotent ack", user_id)
+        return web.Response(
+            text=(
+                "<html><body><h1>Already connected!</h1>"
+                "<p>Your Notion connection is set up — return to Telegram to start saving voice notes.</p>"
+                "</body></html>"
+            ),
+            content_type="text/html",
+            status=200,
+        )
+
+    if state_result.status == "expired":
         logger.warning("OAuth state expired for user %s", user_id)
         with contextlib.suppress(Exception):
             await ptb_app.bot.send_message(
@@ -998,6 +1016,8 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
             content_type="text/html",
             status=400,
         )
+
+    # state_result.status == "ok" — fresh, valid, just marked consumed
 
     # From here we know user_id — wrap the rest so any unexpected exception still
     # produces a user-visible Telegram message (M13).
