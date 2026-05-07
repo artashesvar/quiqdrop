@@ -51,6 +51,7 @@ from src.notion import (
     NotionUnauthorizedError,
     app_redirect_url,
     append_url_block,
+    bouncer_verify,
     close_aiohttp_session,
     create_page,
     exchange_token,
@@ -260,11 +261,6 @@ def _truncate_url(url: str, max_len: int = 45) -> str:
     return url[:max_len] + "..." if len(url) > max_len else url
 
 
-# Notion page IDs are always 32 consecutive hex chars in the URL.
-# Reject any bouncer path that doesn't contain one — prevents using our server
-# as an open redirector to arbitrary notion.so paths.
-_NOTION_PAGE_ID_RE = re.compile(r"[0-9a-f]{32}", re.IGNORECASE)
-
 _NOTION_WEB_PREFIX = "https://www.notion.so/"
 
 
@@ -307,16 +303,23 @@ _APP_REDIRECT_HTML = """<!DOCTYPE html>
 
 
 async def _app_redirect_handler(request: web.Request) -> web.Response:
-    """Serve the deep-link bouncer page for /r/{path}."""
+    """Serve the deep-link bouncer page for /r/{path}?sig=…&...
+
+    Verifies the HMAC signature: only paths we generated via app_redirect_url
+    are accepted. Closes the open-redirector hole on our domain — an attacker
+    can't craft /r/login-… URLs that bounce to a real Notion login.
+    """
     path = request.match_info.get("path", "")
-    query = request.rel_url.query_string
-    suffix = f"?{query}" if query else ""
+    # Pull sig out and rebuild the canonical query that was originally signed.
+    query_pairs = [(k, v) for k, v in request.rel_url.query.items() if k != "sig"]
+    sig = request.rel_url.query.get("sig", "")
+    canonical_query = urlencode(query_pairs)
 
-    # Reject paths that don't look like a real Notion page (no 32-char hex page ID).
-    if not _NOTION_PAGE_ID_RE.search(path):
-        logger.warning("Bouncer: rejected invalid path (no Notion page ID): %.200s", path)
-        return _html_response("Invalid Notion link.", status=400)
+    if not bouncer_verify(path, canonical_query, sig):
+        logger.warning("Bouncer: signature verification failed for path=%.200s", path)
+        return _html_response("Invalid or expired Notion link.", status=400)
 
+    suffix = f"?{canonical_query}" if canonical_query else ""
     notion_web = f"{_NOTION_WEB_PREFIX}{path}{suffix}"
     notion_app = f"notion://www.notion.so/{path}{suffix}"
     logger.debug("Bouncer: serving redirect for path=%.80s", path)
@@ -325,7 +328,7 @@ async def _app_redirect_handler(request: web.Request) -> web.Response:
         web_json=_js_str(notion_web),
         app_json=_js_str(notion_app),
     )
-    # Bouncer adds a CSP allowing inline script (we generate the script ourselves) but no external loads.
+    # CSP allows our inline script + style only, no external loads.
     return _html_response(body, extra_headers={
         "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src 'none'",
     })

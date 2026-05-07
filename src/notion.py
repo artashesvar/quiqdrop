@@ -1,7 +1,11 @@
 # Notion API integration — OAuth token exchange, page search, page creation
 from __future__ import annotations
+import base64
+import hashlib
+import hmac
 import logging
 from datetime import datetime, timezone
+from urllib.parse import urlencode, urlparse
 
 import aiohttp
 from notion_client import AsyncClient
@@ -94,10 +98,39 @@ async def close_aiohttp_session() -> None:
 _NOTION_WEB_PREFIX = "https://www.notion.so/"
 
 
+def _bouncer_secret() -> bytes:
+    """Derive a stable HMAC key from the bot token. The bot token is required and
+    secret already, so reusing it avoids introducing a new env var."""
+    return hashlib.sha256(config.TELEGRAM_BOT_TOKEN.encode("utf-8")).digest()
+
+
+def _bouncer_payload(path: str, query: str) -> bytes:
+    """Canonical bytes signed for a bouncer URL: '<path>?<query>' (no ? if empty)."""
+    canonical = f"{path}?{query}" if query else path
+    return canonical.encode("utf-8")
+
+
+def bouncer_sign(path: str, query: str = "") -> str:
+    """Return a short HMAC tag for a bouncer (path, query). 12 bytes (96 bits) is
+    plenty against an online attacker — they can't bulk-grind signatures."""
+    mac = hmac.new(_bouncer_secret(), _bouncer_payload(path, query), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac[:12]).decode("ascii").rstrip("=")
+
+
+def bouncer_verify(path: str, query: str, sig: str) -> bool:
+    """Constant-time signature check."""
+    if not sig:
+        return False
+    expected = bouncer_sign(path, query)
+    return hmac.compare_digest(sig, expected)
+
+
 def app_redirect_url(notion_url: str) -> str:
     """
-    Wrap a notion.so page URL in our /r/{path} bouncer so tapping it on mobile
-    opens the Notion app (notion:// scheme) instead of forcing a browser login.
+    Wrap a notion.so page URL in our /r/{path}?sig=… bouncer so tapping it on
+    mobile opens the Notion app (notion:// scheme) instead of forcing a browser
+    login. The HMAC signature ensures the bouncer only redirects to URLs we
+    actually generated — closes the open-redirector hole on our domain.
     Falls back to the original https URL if the prefix doesn't match (safety net).
     """
     if not notion_url.startswith(_NOTION_WEB_PREFIX):
@@ -108,8 +141,13 @@ def app_redirect_url(notion_url: str) -> str:
             _NOTION_WEB_PREFIX, notion_url,
         )
         return notion_url
-    path = notion_url[len(_NOTION_WEB_PREFIX):]
-    return f"{config.BASE_URL}/r/{path}"
+    parsed = urlparse(notion_url)
+    # parsed.path starts with "/" — strip leading "/" to mirror the {path:.*} match.
+    path = parsed.path.lstrip("/")
+    query = parsed.query  # may be ""
+    sig = bouncer_sign(path, query)
+    bouncer_query = f"{query}&sig={sig}" if query else f"sig={sig}"
+    return f"{config.BASE_URL}/r/{path}?{bouncer_query}"
 
 
 class NotionError(Exception):
