@@ -764,7 +764,7 @@ async def _save_and_reply(
         f"{saved_line}\n\n"
         f"📄 {title_md}\n\n"
         f"{summary_md}\n\n"
-        f"[Open in Notion ↗]({link_href})",
+        f"Open in Notion 👇\n{link_href}",
         parse_mode="Markdown",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup([
