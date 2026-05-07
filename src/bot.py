@@ -86,13 +86,16 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # Removed from the set in handle_voice's finally block.
 _processing_users: set[int] = set()
 
-# Maps user_id → page_id of the last successfully created note.
+# Maps user_id → (note_page_id, parent_page_id) for the last successfully created note.
+# parent_page_id is captured so append_url_block can verify the page actually belongs
+# under the user's chosen destination before appending.
 # Cleared when user starts a new voice note.
-_last_note_page: dict[int, str] = {}
+_last_note_page: dict[int, tuple[str, str]] = {}
 
-# Maps user_id → (page_id, expires_at_monotonic) when awaiting a URL to attach.
+# Maps user_id → (note_page_id, parent_page_id, expires_at_monotonic) when awaiting a URL.
+# parent_page_id is carried so append_url_block can verify the page belongs to the user.
 # Cleared on URL received, /cancel, timeout, or new voice note.
-_pending_url: dict[int, tuple[str, float]] = {}
+_pending_url: dict[int, tuple[str, str, float]] = {}
 _PENDING_URL_TTL_SEC = 300  # 5 minutes
 
 # City-labelled timezone options — maps display label to UTC offset string stored in DB.
@@ -522,14 +525,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
     elif data == "add_url":
-        page_id = _last_note_page.get(user.id)
-        if not page_id:
+        last = _last_note_page.get(user.id)
+        if not last:
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(
                 "This note is too old to attach a URL."
             )
             return
-        _pending_url[user.id] = (page_id, time.monotonic() + _PENDING_URL_TTL_SEC)
+        page_id, parent_page_id = last
+        _pending_url[user.id] = (page_id, parent_page_id, time.monotonic() + _PENDING_URL_TTL_SEC)
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(
             "Send me the URL to add to your note, or /cancel to stop."
@@ -661,7 +665,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         summary_md = _md(structured.get("summary") or "")
         try:
             page_id, page_url = await create_page(token, parent_page_id, structured, transcript)
-            _last_note_page[user.id] = page_id
+            _last_note_page[user.id] = (page_id, parent_page_id)
             saved_line = "✅ Saved to Notion - only the first 3 min!" if is_trimmed else "✅ Saved to Notion!"
             link_href = app_redirect_url(page_url)
             await update.message.reply_text(
@@ -762,7 +766,7 @@ async def handle_pending_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await handle_unknown(update, context)
         return
 
-    page_id, expires_at = _pending_url[user.id]
+    page_id, parent_page_id, expires_at = _pending_url[user.id]
     if time.monotonic() > expires_at:
         _pending_url.pop(user.id, None)
         await update.message.reply_text(
@@ -790,11 +794,16 @@ async def handle_pending_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     token, _, _2 = config_row
 
     try:
-        await append_url_block(token, page_id, url_text)
+        await append_url_block(token, page_id, url_text, expected_parent_id=parent_page_id)
         await update.message.reply_text("✅ URL added to your note!")
     except NotionUnauthorizedError:
         await update.message.reply_text(
             "⚠️ Notion connection expired. Use /connect to reconnect."
+        )
+    except NotionPageNotFoundError:
+        logger.warning("append_url_block: page missing or parent mismatch for user %s", user.id)
+        await update.message.reply_text(
+            "⚠️ Couldn't find that note in Notion anymore. Send a new voice note to start over."
         )
     except NotionError as e:
         logger.error("append_url_block failed for user %s: %s", user.id, e)

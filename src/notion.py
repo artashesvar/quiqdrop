@@ -18,6 +18,59 @@ _notion = AsyncClient()
 # Notion API enforces a 2000-char limit per rich_text content block
 _RICH_TEXT_LIMIT = 2000
 
+# Conservative chunk size — leaves headroom for unicode, escape sequences, and any
+# character growth in serialization. We pick on a sentence/word boundary when possible.
+_CHUNK_SIZE = 1900
+
+
+def _split_for_rich_text(text: str, chunk_size: int = _CHUNK_SIZE) -> list[str]:
+    """
+    Split a string into chunks ≤ chunk_size, preferring sentence then word boundaries.
+    Used to keep paragraph/list blocks under Notion's 2000-char rich_text limit.
+    Returns at least one chunk (possibly empty if input was empty).
+    """
+    text = text or ""
+    if len(text) <= chunk_size:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > chunk_size:
+        cut = chunk_size
+        # Prefer sentence boundary (. ! ? followed by space) within the last 200 chars
+        boundary = max(
+            remaining.rfind(". ", cut - 200, cut),
+            remaining.rfind("! ", cut - 200, cut),
+            remaining.rfind("? ", cut - 200, cut),
+        )
+        if boundary == -1:
+            # Fall back to word boundary
+            boundary = remaining.rfind(" ", cut - 200, cut)
+        if boundary == -1:
+            # Hard cut — no whitespace anywhere reasonable
+            boundary = cut
+        else:
+            boundary += 1  # include the space/punctuation in the previous chunk
+        chunks.append(remaining[:boundary].rstrip())
+        remaining = remaining[boundary:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _paragraphs_for(text: str) -> list[dict]:
+    """Build one or more paragraph blocks for a string, splitting at the rich_text limit."""
+    return [_paragraph(chunk) for chunk in _split_for_rich_text(text) if chunk]
+
+
+def _bullets_for(text: str) -> list[dict]:
+    """Build one or more bulleted_list_item blocks, splitting if the text exceeds the limit."""
+    return [_bullet(chunk) for chunk in _split_for_rich_text(text) if chunk]
+
+
+def _todos_for(text: str) -> list[dict]:
+    """Build one or more to_do blocks, splitting if the text exceeds the limit."""
+    return [_todo(chunk) for chunk in _split_for_rich_text(text) if chunk]
+
 # Shared aiohttp session for OAuth token exchange — avoids reopening a connection
 # pool per /oauth/notion/callback. Created lazily so it lives in the right event loop.
 _aiohttp_session: aiohttp.ClientSession | None = None
@@ -293,36 +346,33 @@ async def create_page(
     Raises NotionPageNotFoundError if parent page is deleted or archived.
     Raises NotionError on all other API failures.
     """
-    # Truncate transcript to stay within Notion's 2000-char rich_text limit
-    if len(transcript) > _RICH_TEXT_LIMIT - 10:
-        logger.warning(
-            "Transcript truncated from %d to %d chars for Notion block",
-            len(transcript), _RICH_TEXT_LIMIT - 10,
-        )
-        transcript = transcript[: _RICH_TEXT_LIMIT - 10] + "…"
+    # Defensive: never trust dict shape — the structured payload comes from Claude
+    # or our own _default_structured fallback.
+    summary = (structured.get("summary") or "").strip()
+    title = (structured.get("title") or "Voice note").strip()
 
-    children: list[dict] = [
-        _heading2("Summary"),
-        _paragraph(structured["summary"]),
-        _divider(),
-    ]
+    children: list[dict] = [_heading2("Summary")]
+    children.extend(_paragraphs_for(summary))
+    children.append(_divider())
 
     if structured.get("key_points"):
         children.append(_heading2("Key Points"))
         for point in structured["key_points"]:
-            children.append(_bullet(point))
+            children.extend(_bullets_for(point))
 
     if structured.get("action_items"):
         children.append(_heading2("Action Items"))
         for item in structured["action_items"]:
-            children.append(_todo(item))
+            children.extend(_todos_for(item))
 
     if structured.get("decisions"):
         children.append(_heading2("Decisions"))
         for decision in structured["decisions"]:
-            children.append(_bullet(decision))
+            children.extend(_bullets_for(decision))
 
-    # Transcript goes in a toggle — keeps the page scannable; full text accessible on demand
+    # Transcript goes in a toggle — full text preserved across paragraph blocks so
+    # long voice notes don't lose data. Each paragraph is ≤_CHUNK_SIZE chars.
+    transcript_blocks = _paragraphs_for(transcript) or [_paragraph("")]
     children.extend([
         _divider(),
         {
@@ -330,13 +380,16 @@ async def create_page(
             "type": "toggle",
             "toggle": {
                 "rich_text": _rt("Full Transcript"),
-                "children": [_paragraph(transcript)],
+                "children": transcript_blocks,
             },
         },
     ])
 
+    # Title: Notion page titles are also rich_text — split if absurdly long.
+    title_chunks = _split_for_rich_text(title, _CHUNK_SIZE)
+    title_rich_text = [{"type": "text", "text": {"content": chunk}} for chunk in title_chunks]
     properties = {
-        "title": {"title": _rt(structured["title"])}
+        "title": {"title": title_rich_text}
     }
 
     try:
@@ -365,12 +418,39 @@ async def create_page(
     return page_id, page_url
 
 
-async def append_url_block(token: str, page_id: str, url: str) -> None:
+async def append_url_block(
+    token: str,
+    page_id: str,
+    url: str,
+    expected_parent_id: str | None = None,
+) -> None:
     """
     Append a paragraph block containing url to an existing page.
+
+    If expected_parent_id is provided, we first verify the page's parent matches
+    (defence-in-depth: prevents a future bug from appending URLs to the wrong page).
+
     Raises NotionUnauthorizedError if token is revoked.
+    Raises NotionPageNotFoundError if page doesn't exist or parent mismatch.
     Raises NotionError on all other API failures.
     """
+    if expected_parent_id is not None:
+        try:
+            page = await _notion.pages.retrieve(page_id=page_id, auth=token)
+        except APIResponseError as e:
+            if e.code == APIErrorCode.Unauthorized:
+                raise NotionUnauthorizedError("Token invalid or revoked") from e
+            if e.code == APIErrorCode.ObjectNotFound:
+                raise NotionPageNotFoundError(f"page_id {page_id} not found") from e
+            raise NotionError(f"append_url_block parent-check failed: {e.code} — {e}") from e
+        actual_parent = page.get("parent", {}).get("page_id")
+        if actual_parent != expected_parent_id:
+            logger.warning(
+                "append_url_block: parent mismatch — page=%s expected_parent=%s actual=%s",
+                page_id, expected_parent_id, actual_parent,
+            )
+            raise NotionPageNotFoundError("Page parent mismatch — refusing to append")
+
     try:
         await _notion.blocks.children.append(
             block_id=page_id,
@@ -380,8 +460,10 @@ async def append_url_block(token: str, page_id: str, url: str) -> None:
     except APIResponseError as e:
         if e.code == APIErrorCode.Unauthorized:
             raise NotionUnauthorizedError("Token invalid or revoked") from e
+        if e.code == APIErrorCode.ObjectNotFound:
+            raise NotionPageNotFoundError("Page not found when appending URL") from e
         raise NotionError(f"append_url_block failed: {e.code} — {e}") from e
-    logger.info("Appended URL block to page %s", page_id)
+    logger.info("Appended URL block to page %s (url=%.80s)", page_id, url)
 
 
 async def test_token(token: str) -> bool:
