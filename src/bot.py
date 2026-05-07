@@ -1,4 +1,5 @@
 # Telegram listener and main entry point
+from __future__ import annotations
 import asyncio
 import contextlib
 import html as html_lib
@@ -82,9 +83,27 @@ logger = logging.getLogger(__name__)
 # Suppress httpx INFO logs — they contain the full bot token in the URL
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Tracks users currently processing a voice note — prevents concurrent API hammering.
-# Removed from the set in handle_voice's finally block.
-_processing_users: set[int] = set()
+# Per-user asyncio.Lock so a single user can't run two voice handlers in parallel.
+# We check `lock.locked()` to reject early with a friendly message instead of queueing.
+# Capped indirectly by _state_sweeper_loop (FIFO eviction at 1000 users).
+_user_locks: dict[int, asyncio.Lock] = {}
+_USER_LOCKS_MAX = 1000
+
+
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    lock = _user_locks.get(user_id)
+    if lock is None:
+        # Cap before insert
+        while len(_user_locks) >= _USER_LOCKS_MAX:
+            oldest = next(iter(_user_locks))
+            stale = _user_locks.pop(oldest, None)
+            if stale and stale.locked():
+                # Don't evict an in-use lock; put it back and bail out of capping.
+                _user_locks[oldest] = stale
+                break
+        lock = asyncio.Lock()
+        _user_locks[user_id] = lock
+    return lock
 
 # Maps user_id → (note_page_id, parent_page_id) for the last successfully created note.
 # parent_page_id is captured so append_url_block can verify the page actually belongs
@@ -279,6 +298,24 @@ async def _app_redirect_handler(request: web.Request) -> web.Response:
 def _default_structured(transcript: str) -> dict:
     """The minimal structured payload we use when AI structuring is disabled or fails."""
     return {"title": "Voice note", "summary": transcript, "key_points": []}
+
+
+_DOWNLOAD_TIMEOUT_SEC = 60  # Cap on Telegram CDN download — prevents the handler hanging forever
+
+
+async def _safe_remove(path: str | None) -> None:
+    """Best-effort file delete: suppress missing-file errors, run in a thread to avoid
+    blocking the event loop, log at DEBUG so cleanup doesn't spam INFO."""
+    if not path:
+        return
+    def _do_remove(p: str) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(p)
+    try:
+        await asyncio.to_thread(_do_remove, path)
+        logger.debug("Cleaned up %s", path)
+    except Exception as exc:
+        logger.warning("Failed to remove %s: %s", path, exc)
 
 
 def _do_trim(src: str, dst: str, max_ms: int) -> None:
@@ -547,8 +584,158 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # Voice message handler
 # ---------------------------------------------------------------------------
 
+async def _resolve_user_config(
+    update: Update, user_id: int
+) -> tuple[str, str] | None:
+    """Auth check. Returns (token, parent_page_id) or replies and returns None."""
+    config_row = await get_user_config(user_id)
+    if config_row is None:
+        await update.message.reply_text(
+            "You need to connect your Notion workspace first.\nUse /connect to get started."
+        )
+        return None
+    token, parent_page_id, _ = config_row
+    if not parent_page_id:
+        await update.message.reply_text(
+            "You haven't selected a destination page yet.\nUse /settings to choose one."
+        )
+        return None
+    return token, parent_page_id
+
+
+async def _download_voice_file(update: Update, file_path: str) -> bool:
+    """Download voice to file_path with a timeout. Replies and returns False on
+    too-large or timeout. True on success."""
+    voice_file = await update.message.voice.get_file()
+    try:
+        await asyncio.wait_for(
+            voice_file.download_to_drive(file_path),
+            timeout=_DOWNLOAD_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.error("Voice download timed out for %s after %ds", file_path, _DOWNLOAD_TIMEOUT_SEC)
+        with contextlib.suppress(Exception):
+            await update.message.reply_text(
+                "📡 Couldn't pull your audio from Telegram in time. Please try again."
+            )
+        return False
+
+    file_size = await asyncio.to_thread(os.path.getsize, file_path)
+    logger.info("Downloaded to %s | size=%d bytes", file_path, file_size)
+    if file_size > _MAX_VOICE_SIZE_BYTES:
+        await update.message.reply_text(
+            "Voice note file is too large. Please send a shorter recording."
+        )
+        return False
+    return True
+
+
+async def _transcribe_with_progress(update: Update, user_id: int, audio_path: str) -> str:
+    """Send the 'hang tight' message + 10s gem nudge, then transcribe. Returns the
+    raw transcript string (may be empty)."""
+    progress_msg = await update.message.reply_text(
+        "Turning your thoughts into text... ✍️ hang tight!"
+    )
+
+    async def _gem_nudge(msg: Message) -> None:
+        await asyncio.sleep(10)
+        try:
+            await msg.edit_text(
+                "Turning your thoughts into text... ✍️ hang tight!\n\n"
+                "Wait, you're dropping gems! 💎 Need a few more seconds. "
+                "Don't want to miss a single one."
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("gem_nudge edit failed for user %s: %s", user_id, exc)
+
+    gem_task = asyncio.create_task(_gem_nudge(progress_msg))
+    try:
+        return await transcribe_audio(audio_path)
+    finally:
+        gem_task.cancel()
+
+
+async def _structure_or_fallback(update: Update, transcript: str) -> dict:
+    """Apply optional cleaning + AI structuring. Returns a structured dict — never raises."""
+    if config.ENABLE_TRANSCRIPT_CLEANING:
+        before = len(transcript)
+        transcript = clean_transcript(transcript)
+        logger.info("Cleaning: %d→%d chars", before, len(transcript))
+
+    if not config.ENABLE_AI_STRUCTURING:
+        return _default_structured(transcript)
+
+    await update.message.reply_text("Extracting the key points for you.")
+    try:
+        return await structure_transcript(transcript)
+    except StructuringError as e:
+        logger.warning("Structuring failed, falling back to plain transcript: %s", e)
+        return _default_structured(transcript)
+
+
+async def _save_and_reply(
+    update: Update,
+    user_id: int,
+    token: str,
+    parent_page_id: str,
+    structured: dict,
+    transcript: str,
+    is_trimmed: bool,
+) -> None:
+    """Send 'sending to Notion', save the page, and reply with the final result.
+    Handles all Notion errors with user-visible messages."""
+    await update.message.reply_text("Sending this straight to your Notion... 🧠")
+    title_md = _md(structured.get("title") or "Voice note")
+    summary_md = _md(structured.get("summary") or "")
+
+    try:
+        page_id, page_url = await create_page(token, parent_page_id, structured, transcript)
+    except NotionUnauthorizedError:
+        logger.warning("Notion token expired for user %s", user_id)
+        await update.message.reply_text(
+            f"📄 {title_md}\n\n{summary_md}\n\n"
+            "⚠️ Notion connection expired. Use /connect to reconnect.",
+            parse_mode="Markdown",
+        )
+        return
+    except NotionPageNotFoundError:
+        logger.warning("Parent page deleted for user %s — clearing stored page", user_id)
+        await save_parent_page(user_id, None)
+        await update.message.reply_text(
+            f"📄 {title_md}\n\n{summary_md}\n\n"
+            "⚠️ The destination page no longer exists in Notion. Use /settings to pick a new one.",
+            parse_mode="Markdown",
+        )
+        return
+    except NotionError as e:
+        logger.error("Notion save failed for user %s: %s", user_id, e)
+        await update.message.reply_text(
+            f"📄 {title_md}\n\n{summary_md}\n\n"
+            "⚠️ Transcribed but couldn't save to Notion. Please try again.",
+            parse_mode="Markdown",
+        )
+        return
+
+    _last_note_page[user_id] = (page_id, parent_page_id)
+    saved_line = "✅ Saved to Notion - only the first 3 min!" if is_trimmed else "✅ Saved to Notion!"
+    link_href = app_redirect_url(page_url)
+    await update.message.reply_text(
+        f"{saved_line}\n\n"
+        f"📄 {title_md}\n\n"
+        f"{summary_md}\n\n"
+        f"[Open in Notion ↗]({link_href})",
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔗 Add URL", callback_data="add_url")],
+        ]),
+    )
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming voice messages: auth check → download → transcribe → structure → Notion."""
+    """Orchestrate: auth check → download → trim → transcribe → structure → save."""
     user = update.effective_user
     duration = update.message.voice.duration
     file_unique_id = update.message.voice.file_unique_id
@@ -558,11 +745,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("That voice clip was a little too short! ⚠️")
         return
 
-    # NOTE: this check-then-add is safe only because there is no `await` between
-    # the membership test and the .add() call below (single event-loop coroutine
-    # cannot preempt mid-block). Do not introduce an await between them, or two
-    # rapid voice notes from the same user could both pass the check.
-    if user.id in _processing_users:
+    lock = _get_user_lock(user.id)
+    if lock.locked():
         await update.message.reply_text(
             "⏳ Your previous recording is still processing, please wait."
         )
@@ -572,176 +756,75 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     _last_note_page.pop(user.id, None)
     _pending_url.pop(user.id, None)
 
-    file_path = f"/tmp/voice_{user.id}_{file_unique_id}.ogg"
+    # Random suffix on the /tmp path so two requests with the same file_unique_id
+    # (rare but possible if Telegram reuses one) can't collide on disk.
+    file_path = f"/tmp/voice_{user.id}_{file_unique_id}_{secrets.token_hex(4)}.ogg"
     trimmed_path: str | None = None
-    _processing_users.add(user.id)
-    try:
-        # Auth check before doing any work
-        config_row = await get_user_config(user.id)
-        if config_row is None:
-            await update.message.reply_text(
-                "You need to connect your Notion workspace first.\nUse /connect to get started."
-            )
-            return
-        token, parent_page_id, _ = config_row
-        if not parent_page_id:
-            await update.message.reply_text(
-                "You haven't selected a destination page yet.\nUse /settings to choose one."
-            )
-            return
 
-        is_trimmed = duration > _MAX_VOICE_DURATION_SEC
-        if is_trimmed:
-            await update.message.reply_text(
-                f"⚠️ Your note is over 3 min — I'll process the first 3 min only..."
-            )
+    async with lock:
+        try:
+            resolved = await _resolve_user_config(update, user.id)
+            if resolved is None:
+                return
+            token, parent_page_id = resolved
 
-        voice_file = await update.message.voice.get_file()
-        await voice_file.download_to_drive(file_path)
-        file_size = os.path.getsize(file_path)
-        logger.info("Downloaded to %s | size=%d bytes", file_path, file_size)
+            if not await _download_voice_file(update, file_path):
+                return
 
-        # Telegram does not expose file size before download, so we check after
-        if file_size > _MAX_VOICE_SIZE_BYTES:
-            await update.message.reply_text(
-                "Voice note file is too large. Please send a shorter recording."
-            )
-            return
-
-        process_path = file_path
-        if is_trimmed:
-            trimmed_path = await _trim_audio(file_path, _MAX_VOICE_DURATION_SEC)
-            process_path = trimmed_path
-
-        progress_msg = await update.message.reply_text(
-            "Turning your thoughts into text... ✍️ hang tight!"
-        )
-
-        async def _gem_nudge(msg: Message) -> None:
-            await asyncio.sleep(10)
-            try:
-                await msg.edit_text(
-                    "Turning your thoughts into text... ✍️ hang tight!\n\n"
-                    "Wait, you're dropping gems! 💎 Need a few more seconds. "
-                    "Don't want to miss a single one."
+            # M14: announce trim AFTER we have the file in hand, so we never promise
+            # a trim that won't happen because of a download failure.
+            is_trimmed = duration > _MAX_VOICE_DURATION_SEC
+            process_path = file_path
+            if is_trimmed:
+                await update.message.reply_text(
+                    "⚠️ Your note is over 3 min — I'll process the first 3 min only..."
                 )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("gem_nudge edit failed for user %s: %s", user.id, exc)
+                trimmed_path = await _trim_audio(file_path, _MAX_VOICE_DURATION_SEC)
+                process_path = trimmed_path
 
-        gem_task = asyncio.create_task(_gem_nudge(progress_msg))
-        try:
-            transcript = await transcribe_audio(process_path)
+            transcript = await _transcribe_with_progress(update, user.id, process_path)
+            if not transcript.strip():
+                await update.message.reply_text(
+                    "I couldn't hear anything clearly — please try again."
+                )
+                return
+
+            structured = await _structure_or_fallback(update, transcript)
+            await _save_and_reply(
+                update, user.id, token, parent_page_id, structured, transcript, is_trimmed
+            )
+
+        except asyncio.TimeoutError:
+            logger.error("Voice processing timed out for user %s", user.id)
+            with contextlib.suppress(Exception):
+                await update.message.reply_text(
+                    "⏳ This took longer than expected. Please try again — a shorter note usually helps."
+                )
+        except (TimedOut, NetworkError) as e:
+            logger.error("Telegram network error for user %s: %s", user.id, e)
+            with contextlib.suppress(Exception):
+                await update.message.reply_text(
+                    "📡 Network hiccup talking to Telegram. Please try sending the voice note again."
+                )
+        except BadRequest as e:
+            logger.error("Telegram bad request for user %s: %s", user.id, e)
+            with contextlib.suppress(Exception):
+                await update.message.reply_text(
+                    "⚠️ Telegram couldn't process that message. Please try again."
+                )
+        except OSError as e:
+            logger.error("File I/O error for user %s: %s", user.id, e)
+            with contextlib.suppress(Exception):
+                await update.message.reply_text(
+                    "⚠️ Couldn't read or save the audio on our side. Please try again."
+                )
+        except Exception as e:
+            logger.error("handle_voice failed for user %s: %s", user.id, e, exc_info=True)
+            with contextlib.suppress(Exception):
+                await update.message.reply_text("Something went wrong. Please try again.")
         finally:
-            gem_task.cancel()
-
-        # Whisper returns empty string for silence, pure noise, or sub-second clips
-        if not transcript.strip():
-            await update.message.reply_text(
-                "I couldn't hear anything clearly — please try again."
-            )
-            return
-
-        if config.ENABLE_TRANSCRIPT_CLEANING:
-            before_len = len(transcript)
-            transcript = clean_transcript(transcript)
-            logger.info("Cleaning: %d→%d chars", before_len, len(transcript))
-
-        if config.ENABLE_AI_STRUCTURING:
-            await update.message.reply_text("Extracting the key points for you.")
-            try:
-                structured = await structure_transcript(transcript)
-            except StructuringError as e:
-                logger.warning("Structuring failed, falling back to plain transcript: %s", e)
-                structured = _default_structured(transcript)
-        else:
-            structured = _default_structured(transcript)
-
-        # Save to Notion
-        await update.message.reply_text("Sending this straight to your Notion... 🧠")
-        # Defensive .get() — never trust the structured dict keys to exist.
-        title_md = _md(structured.get("title") or "Voice note")
-        summary_md = _md(structured.get("summary") or "")
-        try:
-            page_id, page_url = await create_page(token, parent_page_id, structured, transcript)
-            _last_note_page[user.id] = (page_id, parent_page_id)
-            saved_line = "✅ Saved to Notion - only the first 3 min!" if is_trimmed else "✅ Saved to Notion!"
-            link_href = app_redirect_url(page_url)
-            await update.message.reply_text(
-                f"{saved_line}\n\n"
-                f"📄 {title_md}\n\n"
-                f"{summary_md}\n\n"
-                f"[Open in Notion ↗]({link_href})",
-                parse_mode="Markdown",
-                disable_web_page_preview=True,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔗 Add URL", callback_data="add_url")],
-                ]),
-            )
-        except NotionUnauthorizedError:
-            logger.warning("Notion token expired for user %s", user.id)
-            await update.message.reply_text(
-                f"📄 {title_md}\n\n"
-                f"{summary_md}\n\n"
-                "⚠️ Notion connection expired. Use /connect to reconnect.",
-                parse_mode="Markdown",
-            )
-        except NotionPageNotFoundError:
-            logger.warning("Parent page deleted for user %s — clearing stored page", user.id)
-            await save_parent_page(user.id, None)
-            await update.message.reply_text(
-                f"📄 {title_md}\n\n"
-                f"{summary_md}\n\n"
-                "⚠️ The destination page no longer exists in Notion. "
-                "Use /settings to pick a new one.",
-                parse_mode="Markdown",
-            )
-        except NotionError as e:
-            logger.error("Notion save failed for user %s: %s", user.id, e)
-            await update.message.reply_text(
-                f"📄 {title_md}\n\n"
-                f"{summary_md}\n\n"
-                "⚠️ Transcribed but couldn't save to Notion. Please try again.",
-                parse_mode="Markdown",
-            )
-
-    except asyncio.TimeoutError:
-        logger.error("Voice processing timed out for user %s", user.id)
-        with contextlib.suppress(Exception):
-            await update.message.reply_text(
-                "⏳ This took longer than expected. Please try again — a shorter note usually helps."
-            )
-    except (TimedOut, NetworkError) as e:
-        logger.error("Telegram network error for user %s: %s", user.id, e)
-        with contextlib.suppress(Exception):
-            await update.message.reply_text(
-                "📡 Network hiccup talking to Telegram. Please try sending the voice note again."
-            )
-    except BadRequest as e:
-        logger.error("Telegram bad request for user %s: %s", user.id, e)
-        with contextlib.suppress(Exception):
-            await update.message.reply_text(
-                "⚠️ Telegram couldn't process that message. Please try again."
-            )
-    except OSError as e:
-        logger.error("File I/O error for user %s: %s", user.id, e)
-        with contextlib.suppress(Exception):
-            await update.message.reply_text(
-                "⚠️ Couldn't read or save the audio on our side. Please try again."
-            )
-    except Exception as e:
-        logger.error("handle_voice failed for user %s: %s", user.id, e, exc_info=True)
-        with contextlib.suppress(Exception):
-            await update.message.reply_text("Something went wrong. Please try again.")
-    finally:
-        _processing_users.discard(user.id)
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            logger.info("Cleaned up %s", file_path)
-        if trimmed_path and os.path.exists(trimmed_path):
-            os.remove(trimmed_path)
-            logger.info("Cleaned up %s", trimmed_path)
+            await _safe_remove(file_path)
+            await _safe_remove(trimmed_path)
 
 
 # ---------------------------------------------------------------------------
