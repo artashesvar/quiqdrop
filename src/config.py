@@ -31,6 +31,16 @@ NOTION_REDIRECT_URI: str = os.environ["NOTION_REDIRECT_URI"]
 # Base URL of our public web server (Coolify) — derived from the OAuth redirect URI.
 # Used to host the /r/{path} deep-link bouncer that opens notion:// on mobile.
 _parsed_redirect = urlparse(NOTION_REDIRECT_URI)
+# Fail fast on misconfiguration — Notion rejects non-https redirect URIs anyway,
+# but a clear startup error beats a confusing OAuth failure later.
+if _parsed_redirect.scheme != "https":
+    raise RuntimeError(
+        f"NOTION_REDIRECT_URI must use https:// (got: {NOTION_REDIRECT_URI!r})"
+    )
+if not _parsed_redirect.netloc:
+    raise RuntimeError(
+        f"NOTION_REDIRECT_URI is missing a host (got: {NOTION_REDIRECT_URI!r})"
+    )
 _derived_base = f"{_parsed_redirect.scheme}://{_parsed_redirect.netloc}"
 # PUBLIC_BASE_URL overrides the derived value — set this if NOTION_REDIRECT_URI points
 # to a raw IP but you want a real domain in user-visible bouncer links.

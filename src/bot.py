@@ -68,6 +68,37 @@ def _md(text: str) -> str:
     return escape_markdown(text or "", version=1)
 
 
+_DISPLAY_NAME_MAX = 80
+
+
+def _trim_display(text: str, limit: int = _DISPLAY_NAME_MAX) -> str:
+    """Cap user-controlled display strings (workspace names, titles) so they can't
+    blow past Telegram's 4096-char message limit on their own."""
+    if not text:
+        return ""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+# Common security headers for every HTML response we serve (OAuth callback + bouncer).
+# Defence in depth — none of these pages host sensitive cookies, but standard headers
+# are cheap insurance against bugs we haven't written yet.
+_HTML_SECURITY_HEADERS = {
+    "Cache-Control": "no-store, max-age=0",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+}
+
+
+def _html_response(text: str, status: int = 200, extra_headers: dict | None = None) -> web.Response:
+    """Build a text/html response with our standard security headers applied."""
+    headers = dict(_HTML_SECURITY_HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+    return web.Response(text=text, content_type="text/html", status=status, headers=headers)
+
+
 # Accept http(s) URLs; reject anything else when receiving a URL to attach.
 _URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
@@ -284,7 +315,7 @@ async def _app_redirect_handler(request: web.Request) -> web.Response:
     # Reject paths that don't look like a real Notion page (no 32-char hex page ID).
     if not _NOTION_PAGE_ID_RE.search(path):
         logger.warning("Bouncer: rejected invalid path (no Notion page ID): %.200s", path)
-        return web.Response(text="Invalid Notion link.", status=400)
+        return _html_response("Invalid Notion link.", status=400)
 
     notion_web = f"{_NOTION_WEB_PREFIX}{path}{suffix}"
     notion_app = f"notion://www.notion.so/{path}{suffix}"
@@ -294,7 +325,10 @@ async def _app_redirect_handler(request: web.Request) -> web.Response:
         web_json=_js_str(notion_web),
         app_json=_js_str(notion_app),
     )
-    return web.Response(text=body, content_type="text/html")
+    # Bouncer adds a CSP allowing inline script (we generate the script ourselves) but no external loads.
+    return _html_response(body, extra_headers={
+        "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src 'none'",
+    })
 
 
 def _default_structured(transcript: str) -> dict:
@@ -347,7 +381,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config_row = await get_user_config(user.id)
     if config_row is not None:
         _, page_id, page_title = config_row
-        page_status = f"*{_md(page_title)}*" if page_title else ("selected ✅" if page_id else "not selected yet — use /settings")
+        page_status = f"*{_md(_trim_display(page_title))}*" if page_title else ("selected ✅" if page_id else "not selected yet — use /settings")
         await update.message.reply_text(
             f"Welcome back, {_md(user.first_name)}! 👋\n\n"
             f"Your Notion workspace is connected.\n"
@@ -399,8 +433,8 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     _, page_id, page_title = config_row
-    workspace = await get_workspace_name(user.id) or "Notion"
-    page_display = f"*{_md(page_title)}*" if page_title else ("Selected ✅" if page_id else "_not selected yet_")
+    workspace = _trim_display(await get_workspace_name(user.id) or "Notion")
+    page_display = f"*{_md(_trim_display(page_title))}*" if page_title else ("Selected ✅" if page_id else "_not selected yet_")
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Disconnect", callback_data="disconnect_confirm_prompt")],
         [InlineKeyboardButton("⏰ Reminders", callback_data="settings_reminders")],
@@ -479,7 +513,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await save_parent_page(user.id, page_id, page_title)
         logger.info("User %s selected page %s (%s)", user.id, page_id, page_title)
         await query.edit_message_text(
-            f"✅ All set! Your notes will be saved to 👉 *{_md(page_title)}*\n\n"
+            f"✅ All set! Your notes will be saved to 👉 *{_md(_trim_display(page_title))}*\n\n"
             "Send me a voice note anytime 🎤",
             parse_mode="Markdown",
         )
@@ -923,12 +957,9 @@ async def _oauth_callback(request: web.Request, ptb_app: Application) -> web.Res
         return await _oauth_callback_inner(request, ptb_app)
     except Exception:
         logger.exception("Unexpected error in OAuth callback")
-        return web.Response(
-            text=(
-                "<html><body><h1>Something went wrong.</h1>"
-                "<p>Please return to Telegram and try /connect again.</p></body></html>"
-            ),
-            content_type="text/html",
+        return _html_response(
+            "<html><body><h1>Something went wrong.</h1>"
+            "<p>Please return to Telegram and try /connect again.</p></body></html>",
             status=500,
         )
 
@@ -954,19 +985,14 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
                             "When you're ready, use /connect to try again."
                         ),
                     )
-        return web.Response(
-            text=(
-                "<html><body><h1>Connection cancelled.</h1>"
-                "<p>You can return to Telegram and try /connect again whenever you're ready.</p></body></html>"
-            ),
-            content_type="text/html",
-            status=200,
+        return _html_response(
+            "<html><body><h1>Connection cancelled.</h1>"
+            "<p>You can return to Telegram and try /connect again whenever you're ready.</p></body></html>",
         )
 
     if not code or not state:
-        return web.Response(
-            text="<html><body><h1>Invalid request — missing code or state.</h1></body></html>",
-            content_type="text/html",
+        return _html_response(
+            "<html><body><h1>Invalid request — missing code or state.</h1></body></html>",
             status=400,
         )
 
@@ -974,12 +1000,9 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
     user_id = state_result.user_id
     if state_result.status == "unknown":
         logger.warning("OAuth callback received unknown state: %s", state)
-        return web.Response(
-            text=(
-                "<html><body><h1>Unknown session.</h1>"
-                "<p>Please return to Telegram and use /connect again.</p></body></html>"
-            ),
-            content_type="text/html",
+        return _html_response(
+            "<html><body><h1>Unknown session.</h1>"
+            "<p>Please return to Telegram and use /connect again.</p></body></html>",
             status=400,
         )
 
@@ -988,14 +1011,10 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
         # The first hit already completed the connection. Show a friendly success page
         # without re-running the token exchange.
         logger.info("OAuth callback retry on consumed state for user %s — idempotent ack", user_id)
-        return web.Response(
-            text=(
-                "<html><body><h1>Already connected!</h1>"
-                "<p>Your Notion connection is set up — return to Telegram to start saving voice notes.</p>"
-                "</body></html>"
-            ),
-            content_type="text/html",
-            status=200,
+        return _html_response(
+            "<html><body><h1>Already connected!</h1>"
+            "<p>Your Notion connection is set up — return to Telegram to start saving voice notes.</p>"
+            "</body></html>",
         )
 
     if state_result.status == "expired":
@@ -1008,12 +1027,9 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
                     "Use /connect to start fresh — it only takes a moment."
                 ),
             )
-        return web.Response(
-            text=(
-                "<html><body><h1>This link expired.</h1>"
-                "<p>Return to Telegram and use /connect again to get a fresh link.</p></body></html>"
-            ),
-            content_type="text/html",
+        return _html_response(
+            "<html><body><h1>This link expired.</h1>"
+            "<p>Return to Telegram and use /connect again to get a fresh link.</p></body></html>",
             status=400,
         )
 
@@ -1031,12 +1047,9 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
                     chat_id=user_id,
                     text="❌ Couldn't complete the Notion connection. Please try /connect again.",
                 )
-            return web.Response(
-                text=(
-                    "<html><body><h1>Failed to connect to Notion.</h1>"
-                    "<p>Return to Telegram and try /connect again.</p></body></html>"
-                ),
-                content_type="text/html",
+            return _html_response(
+                "<html><body><h1>Failed to connect to Notion.</h1>"
+                "<p>Return to Telegram and try /connect again.</p></body></html>",
                 status=500,
             )
 
@@ -1054,12 +1067,9 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
                     chat_id=user_id,
                     text="❌ Notion accepted the connection but the access token didn't work. Please try /connect again.",
                 )
-            return web.Response(
-                text=(
-                    "<html><body><h1>Connection invalid.</h1>"
-                    "<p>Return to Telegram and try /connect again.</p></body></html>"
-                ),
-                content_type="text/html",
+            return _html_response(
+                "<html><body><h1>Connection invalid.</h1>"
+                "<p>Return to Telegram and try /connect again.</p></body></html>",
                 status=500,
             )
 
@@ -1075,7 +1085,7 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
             pages = []
             search_failed = True
 
-        workspace_md = _md(workspace_name)
+        workspace_md = _md(_trim_display(workspace_name))
         if search_failed:
             await ptb_app.bot.send_message(
                 chat_id=user_id,
@@ -1099,7 +1109,7 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
                         chat_id=user_id,
                         text=(
                             f"Connected to *{workspace_md}* 🎉\n\n"
-                            f"Your notes will be saved to 👉 *{_md(cached['title'])}*\n\n"
+                            f"Your notes will be saved to 👉 *{_md(_trim_display(cached['title']))}*\n\n"
                             "Send me a voice note anytime 🎤"
                         ),
                         parse_mode="Markdown",
@@ -1136,14 +1146,11 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
                 parse_mode="Markdown",
             )
 
-        return web.Response(
-            text=(
-                "<html><body>"
-                "<h1>Connected to Notion!</h1>"
-                "<p>You can close this tab and return to Telegram.</p>"
-                "</body></html>"
-            ),
-            content_type="text/html",
+        return _html_response(
+            "<html><body>"
+            "<h1>Connected to Notion!</h1>"
+            "<p>You can close this tab and return to Telegram.</p>"
+            "</body></html>",
         )
     except Exception:
         logger.exception("Unexpected error in OAuth callback for user %s", user_id)
