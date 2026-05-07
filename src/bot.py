@@ -759,7 +759,7 @@ async def _save_and_reply(
 
     _last_note_page[user_id] = (page_id, parent_page_id)
     saved_line = "✅ Saved to Notion - only the first 3 min!" if is_trimmed else "✅ Saved to Notion!"
-    link_href = app_redirect_url(page_url)
+    link_href = page_url
     await update.message.reply_text(
         f"{saved_line}\n\n"
         f"📄 {title_md}\n\n"
