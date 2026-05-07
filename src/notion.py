@@ -48,6 +48,12 @@ def app_redirect_url(notion_url: str) -> str:
     Falls back to the original https URL if the prefix doesn't match (safety net).
     """
     if not notion_url.startswith(_NOTION_WEB_PREFIX):
+        # Notion can in principle return notion.site / enterprise-domain URLs we don't
+        # cover. Log so we know when this path triggers — silent fallback hides UX bugs.
+        logger.warning(
+            "app_redirect_url: URL does not start with %s — falling back unwrapped: %.120s",
+            _NOTION_WEB_PREFIX, notion_url,
+        )
         return notion_url
     path = notion_url[len(_NOTION_WEB_PREFIX):]
     return f"{config.BASE_URL}/r/{path}"
@@ -137,8 +143,13 @@ async def exchange_token(code: str) -> tuple[str, str]:
             logger.error("Notion token exchange failed: status=%d body=%s", resp.status, body)
             raise NotionOAuthError(f"Token exchange failed ({resp.status}): {body.get('error')}")
 
-    access_token: str = body["access_token"]
-    workspace_name: str = body.get("workspace_name", "Notion")
+    # Defensive: don't blindly index — Notion outage edge cases or proxy oddities
+    # have produced 200 responses without the expected fields. Surface as our error type.
+    access_token = body.get("access_token")
+    if not access_token or not isinstance(access_token, str):
+        logger.error("Notion token exchange: 200 OK but missing/invalid access_token: %s", body)
+        raise NotionOAuthError("Token exchange returned no access_token")
+    workspace_name = body.get("workspace_name") or "Notion"
     logger.info("OAuth token exchange successful (workspace: %s)", workspace_name)
     return access_token, workspace_name
 
@@ -344,8 +355,12 @@ async def create_page(
             raise NotionPageNotFoundError("Parent page is archived (deleted)") from e
         raise NotionError(f"create_page failed: {e.code} — {e}") from e
 
-    page_id: str = response["id"]
-    page_url: str = response["url"]
+    if not isinstance(response, dict):
+        raise NotionError(f"create_page: unexpected response type {type(response).__name__}")
+    page_id = response.get("id")
+    page_url = response.get("url")
+    if not page_id or not page_url:
+        raise NotionError(f"create_page: response missing id or url (keys: {list(response.keys())})")
     logger.info("Created Notion page: %s", page_id)
     return page_id, page_url
 

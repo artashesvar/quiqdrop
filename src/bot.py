@@ -54,6 +54,7 @@ from src.notion import (
     create_page,
     exchange_token,
     search_pages,
+    test_token,
 )
 from src.structure import StructuringError, structure_transcript
 from src.text_cleaner import clean_transcript
@@ -272,29 +273,9 @@ async def _app_redirect_handler(request: web.Request) -> web.Response:
     return web.Response(text=body, content_type="text/html")
 
 
-def _format_structured(data: dict) -> str:
-    """Format a structured dict into a readable Telegram message."""
-    parts = [f"📝 {data['title']}", "", data["summary"]]
-
-    if data.get("key_points"):
-        parts.append("")
-        parts.append("💡 Key Points:")
-        for point in data["key_points"]:
-            parts.append(f"• {point}")
-
-    if data.get("action_items"):
-        parts.append("")
-        parts.append("✅ Action Items:")
-        for item in data["action_items"]:
-            parts.append(f"• {item}")
-
-    if data.get("decisions"):
-        parts.append("")
-        parts.append("🧠 Decisions:")
-        for decision in data["decisions"]:
-            parts.append(f"• {decision}")
-
-    return "\n".join(parts)
+def _default_structured(transcript: str) -> dict:
+    """The minimal structured payload we use when AI structuring is disabled or fails."""
+    return {"title": "Voice note", "summary": transcript, "key_points": []}
 
 
 def _do_trim(src: str, dst: str, max_ms: int) -> None:
@@ -669,14 +650,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 structured = await structure_transcript(transcript)
             except StructuringError as e:
                 logger.warning("Structuring failed, falling back to plain transcript: %s", e)
-                structured = {"title": "Voice note", "summary": transcript, "key_points": []}
+                structured = _default_structured(transcript)
         else:
-            structured = {"title": "Voice note", "summary": transcript, "key_points": []}
+            structured = _default_structured(transcript)
 
         # Save to Notion
         await update.message.reply_text("Sending this straight to your Notion... 🧠")
-        title_md = _md(structured["title"])
-        summary_md = _md(structured["summary"])
+        # Defensive .get() — never trust the structured dict keys to exist.
+        title_md = _md(structured.get("title") or "Voice note")
+        summary_md = _md(structured.get("summary") or "")
         try:
             page_id, page_url = await create_page(token, parent_page_id, structured, transcript)
             _last_note_page[user.id] = page_id
@@ -925,88 +907,140 @@ async def _oauth_callback_inner(request: web.Request, ptb_app: Application) -> w
             status=400,
         )
 
+    # From here we know user_id — wrap the rest so any unexpected exception still
+    # produces a user-visible Telegram message (M13).
     try:
-        access_token, workspace_name = await exchange_token(code)
-    except NotionOAuthError as e:
-        logger.error("Token exchange failed for user %s: %s", user_id, e)
-        return web.Response(
-            text=(
-                "<html><body><h1>Failed to connect to Notion.</h1>"
-                "<p>Please return to Telegram and try /connect again.</p></body></html>"
-            ),
-            content_type="text/html",
-            status=500,
-        )
-
-    await save_user_token(user_id, access_token, workspace_name)
-    logger.info("OAuth complete for user %s (workspace: %s)", user_id, workspace_name)
-
-    try:
-        pages = await search_pages(access_token)
-    except NotionError as e:
-        logger.error("search_pages failed after OAuth for user %s: %s", user_id, e)
-        pages = []
-
-    workspace_md = _md(workspace_name)
-    if pages:
-        keyboard = _build_parent_keyboard(user_id, pages)
-        top_level = keyboard.inline_keyboard
-        if len(top_level) == 1:
-            # Only one page shared — auto-select it, no picker needed.
-            short_id = int(top_level[0][0].callback_data.split(":")[1])
-            cached = _page_cache.get(user_id, {}).get(short_id)
-            if cached:
-                await save_parent_page(user_id, cached["id"], cached["title"])
+        try:
+            access_token, workspace_name = await exchange_token(code)
+        except NotionOAuthError as e:
+            logger.error("Token exchange failed for user %s: %s", user_id, e)
+            with contextlib.suppress(Exception):
                 await ptb_app.bot.send_message(
                     chat_id=user_id,
-                    text=(
-                        f"Connected to *{workspace_md}* 🎉\n\n"
-                        f"Your notes will be saved to 👉 *{_md(cached['title'])}*\n\n"
-                        "Send me a voice note anytime 🎤"
-                    ),
-                    parse_mode="Markdown",
+                    text="❌ Couldn't complete the Notion connection. Please try /connect again.",
                 )
-            else:
-                # Cache miss — fall back to picker
+            return web.Response(
+                text=(
+                    "<html><body><h1>Failed to connect to Notion.</h1>"
+                    "<p>Return to Telegram and try /connect again.</p></body></html>"
+                ),
+                content_type="text/html",
+                status=500,
+            )
+
+        # Verify the token is actually usable BEFORE persisting it. A 200 with a bad
+        # token would otherwise quietly land in the DB and fail at first voice note.
+        try:
+            token_ok = await test_token(access_token)
+        except NotionError as e:
+            logger.error("test_token errored for user %s: %s", user_id, e)
+            token_ok = False
+        if not token_ok:
+            logger.error("Token from Notion failed test_token for user %s", user_id)
+            with contextlib.suppress(Exception):
                 await ptb_app.bot.send_message(
                     chat_id=user_id,
-                    text=f"Connected to *{workspace_md}* 🎉\n\nNow choose where to save your notes:",
+                    text="❌ Notion accepted the connection but the access token didn't work. Please try /connect again.",
+                )
+            return web.Response(
+                text=(
+                    "<html><body><h1>Connection invalid.</h1>"
+                    "<p>Return to Telegram and try /connect again.</p></body></html>"
+                ),
+                content_type="text/html",
+                status=500,
+            )
+
+        await save_user_token(user_id, access_token, workspace_name)
+        logger.info("OAuth complete for user %s (workspace: %s)", user_id, workspace_name)
+
+        # Distinguish "API call failed" from "API succeeded with zero pages" (H1).
+        search_failed = False
+        try:
+            pages = await search_pages(access_token)
+        except NotionError as e:
+            logger.error("search_pages failed after OAuth for user %s: %s", user_id, e)
+            pages = []
+            search_failed = True
+
+        workspace_md = _md(workspace_name)
+        if search_failed:
+            await ptb_app.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"Connected to *{workspace_md}* 🎉\n\n"
+                    "But I couldn't reach the Notion API to load your pages just now. "
+                    "Open /settings in a moment and try again — your connection is saved."
+                ),
+                parse_mode="Markdown",
+            )
+        elif pages:
+            keyboard = _build_parent_keyboard(user_id, pages)
+            top_level = keyboard.inline_keyboard
+            if len(top_level) == 1:
+                # Only one page shared — auto-select it, no picker needed.
+                short_id = int(top_level[0][0].callback_data.split(":")[1])
+                cached = _page_cache.get(user_id, {}).get(short_id)
+                if cached:
+                    await save_parent_page(user_id, cached["id"], cached["title"])
+                    await ptb_app.bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"Connected to *{workspace_md}* 🎉\n\n"
+                            f"Your notes will be saved to 👉 *{_md(cached['title'])}*\n\n"
+                            "Send me a voice note anytime 🎤"
+                        ),
+                        parse_mode="Markdown",
+                    )
+                else:
+                    # Cache miss — fall back to picker
+                    await ptb_app.bot.send_message(
+                        chat_id=user_id,
+                        text=f"Connected to *{workspace_md}* 🎉\n\nNow choose where to save your notes:",
+                        parse_mode="Markdown",
+                        reply_markup=keyboard,
+                    )
+            elif top_level:
+                await ptb_app.bot.send_message(
+                    chat_id=user_id,
+                    text=f"Connected to *{workspace_md}* 🎉\n\nYou shared more than 1 page. Pick the one as your final destination.",
                     parse_mode="Markdown",
                     reply_markup=keyboard,
                 )
-        elif top_level:
-            await ptb_app.bot.send_message(
-                chat_id=user_id,
-                text=f"Connected to *{workspace_md}* 🎉\n\nYou shared more than 1 page. Pick the one as your final destination.",
-                parse_mode="Markdown",
-                reply_markup=keyboard,
-            )
+            else:
+                await ptb_app.bot.send_message(
+                    chat_id=user_id,
+                    text=f"Connected to *{workspace_md}* 🎉\n\n{_NO_TOP_LEVEL_MSG}",
+                    parse_mode="Markdown",
+                )
         else:
             await ptb_app.bot.send_message(
                 chat_id=user_id,
-                text=f"Connected to *{workspace_md}* 🎉\n\n{_NO_TOP_LEVEL_MSG}",
+                text=(
+                    f"Connected to *{workspace_md}* 🎉\n\n"
+                    "No pages found yet. Share a page with the QuiqDrop integration in Notion, "
+                    "then use /settings to select it."
+                ),
                 parse_mode="Markdown",
             )
-    else:
-        await ptb_app.bot.send_message(
-            chat_id=user_id,
-            text=(
-                f"Connected to *{workspace_md}* 🎉\n\n"
-                "No pages found yet. Share a page with the QuiqDrop integration in Notion, "
-                "then use /settings to select it."
-            ),
-            parse_mode="Markdown",
-        )
 
-    return web.Response(
-        text=(
-            "<html><body>"
-            "<h1>Connected to Notion!</h1>"
-            "<p>You can close this tab and return to Telegram.</p>"
-            "</body></html>"
-        ),
-        content_type="text/html",
-    )
+        return web.Response(
+            text=(
+                "<html><body>"
+                "<h1>Connected to Notion!</h1>"
+                "<p>You can close this tab and return to Telegram.</p>"
+                "</body></html>"
+            ),
+            content_type="text/html",
+        )
+    except Exception:
+        logger.exception("Unexpected error in OAuth callback for user %s", user_id)
+        with contextlib.suppress(Exception):
+            await ptb_app.bot.send_message(
+                chat_id=user_id,
+                text="❌ Something went wrong while completing your connection. Please try /connect again.",
+            )
+        raise
 
 
 def _create_web_app(ptb_app: Application) -> web.Application:
